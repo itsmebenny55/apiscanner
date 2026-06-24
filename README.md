@@ -1,5 +1,6 @@
 <meta content="VvYq2k5BFp5dpIL6JpQhoe90sWEXZTEBbaynlEKCWRE" name="google-site-verification">
-## **APISCAN OWASP 5.0 APIscanner by Perry Mertens**
+
+**APISCAN OWASP 5.0 APIscanner by Perry Mertens**
 
 **Author:** Perry Mertens (pamsniffer@gmail.com)  
 **Year:**  2026 Perry Mertens  
