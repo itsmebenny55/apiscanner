@@ -1,9 +1,10 @@
 ########################################################
 # APISCAN - API Security Scanner                       #
 # Licensed under the AGPL-v3.0                         #
-# Author: Perry Mertens pamsniffer@gmail.com (C) 2025  #
-# version 4.0 26-04-2026                              #
-########################################################                   
+# Author: Perry Mertens pamsniffer@gmail.com (C) 2026  #
+# version 5.0 24-06-2026                               #
+########################################################
+                   
 from __future__ import annotations
 import base64
 import json
@@ -201,6 +202,16 @@ class AuthAuditor:
 
     #================funtion _test_rate_limiting _test_rate_limiting =============
     def _test_rate_limiting(self, endpoint: Dict[str, Any]) -> None:
+        # Skip rate-limit test when scanning without authentication —
+        # we can't determine if rate limiting exists when every request returns 401.
+        has_auth = bool(
+            getattr(self.session, "auth", None)
+            or any(h.lower() in ("authorization", "x-api-key", "x-auth-token")
+                   for h in (getattr(self.session, "headers", {}) or {}).keys())
+        )
+        if not has_auth:
+            return
+
         method = endpoint.get('method', 'POST').upper()
         processed = False
         last_resp: Optional[requests.Response] = None
@@ -214,7 +225,7 @@ class AuthAuditor:
             if last_resp.status_code in (404, 405, 501):
                 self._log_issue(endpoint['url'], f'Method {method} not allowed - RL test skipped', 'Info', response_obj=last_resp)
                 return
-            if last_resp.status_code < 500:
+            if 200 <= last_resp.status_code < 300:
                 processed = True
         if processed:
             self._log_issue(endpoint['url'], 'No rate-limiting on auth endpoint', 'Medium', response_obj=last_resp)
@@ -261,6 +272,23 @@ class AuthAuditor:
 
     #================funtion _test_secure_transport _test_secure_transport =============
     def _test_secure_transport(self) -> None:
+        # Skip all HTTPS/redirect tests for localhost/loopback/private IPs —
+        # HSTS and HTTPS are meaningless on these addresses in dev/test environments.
+        host_lower = self._host.lower() if hasattr(self, '_host') else ''
+        if host_lower in ('127.0.0.1', 'localhost', '::1', '0.0.0.0'):
+            return
+        # Also skip RFC 1918 private addresses (192.168.x.x, 10.x.x.x, 172.16-31.x.x)
+        if host_lower.startswith(('192.168.', '10.', '172.')):
+            try:
+                parts = host_lower.split('.')
+                if len(parts) == 4:
+                    second = int(parts[1])
+                    if host_lower.startswith('172.') and 16 <= second <= 31:
+                        return
+                    elif host_lower.startswith(('192.168.', '10.')):
+                        return
+            except (ValueError, IndexError):
+                pass
         if self.base_url.startswith('http://'):
             self._log_issue(self.base_url, 'Service uses HTTP instead of HTTPS', 'Critical')
             return  # no TLS tests for plaintext HTTP target
@@ -281,7 +309,16 @@ class AuthAuditor:
     def _test_tls_versions_improved(self) -> None:
         host = self._host
         port = self._port
-        deprecated_protocols = [(ssl.PROTOCOL_SSLv2, 'SSLv2'), (ssl.PROTOCOL_SSLv3, 'SSLv3'), (ssl.PROTOCOL_TLSv1, 'TLSv1.0'), (ssl.PROTOCOL_TLSv1_1, 'TLSv1.1')]
+        # SSLv2/SSLv3/TLSv1.0/TLSv1.1 constants removed in Python 3.10+; guard with hasattr
+        deprecated_protocols: List[Tuple[Any, str]] = []
+        for attr, label in [
+            ('PROTOCOL_SSLv2', 'SSLv2'),
+            ('PROTOCOL_SSLv3', 'SSLv3'),
+            ('PROTOCOL_TLSv1', 'TLSv1.0'),
+            ('PROTOCOL_TLSv1_1', 'TLSv1.1'),
+        ]:
+            if hasattr(ssl, attr):
+                deprecated_protocols.append((getattr(ssl, attr), label))
         for protocol, name in deprecated_protocols:
             try:
                 context = ssl.SSLContext(protocol)
@@ -597,7 +634,13 @@ class AuthAuditor:
     def _test_password_hash_strength(self, endpoints: List[Dict[str, Any]]) -> None:
         if not endpoints:
             return
-        weak_re = re.compile('^\\$2[aby]\\$|\\$argon2', re.I)
+        # Detect weak hashing: MD5/SHA1/SHA256/SHA512 crypt prefixes, plain hex hashes,
+        # and unsalted legacy formats.  Bcrypt ($2a/$2b/$2y) and Argon2 are strong.
+        weak_re = re.compile(
+            r'^\$(?:1|5|6|apr1|P|H|md5|sha1|sha256|sha512|sha2)\$|'  # weak crypt prefixes
+            r'\b(?:[a-f0-9]{32}|[a-f0-9]{40}|[a-f0-9]{64})\b',       # plain MD5/SHA1/SHA256 hex
+            re.I,
+        )
         get_eps = [ep for ep in endpoints if ep.get('method', '').upper() == 'GET']
         it = tqdm(get_eps, desc='password-hash GETs', unit='endpoint', leave=False) if self.show_progress else get_eps
         for ep in it:

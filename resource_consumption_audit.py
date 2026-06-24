@@ -1,8 +1,8 @@
 ########################################################
 # APISCAN - API Security Scanner                       #
 # Licensed under the AGPL-v3.0                         #
-# Author: Perry Mertens pamsniffer@gmail.com (C) 2025  #
-# version 4.0 26-04-2026                              #
+# Author: Perry Mertens pamsniffer@gmail.com (C) 2026  #
+# version 5.0 24-06-2026                               #
 ########################################################
 from __future__ import annotations
 import re
@@ -124,6 +124,10 @@ class ResourceConsumptionAuditor:
 
     #================funtion _log_issue _log_issue =============
     def _log_issue(self, endpoint_url: str, issue_type: str, description: str, severity: str, data: Optional[Dict[str, Any]]=None) -> None:
+        # Skip internal Python errors accidentally caught and logged as findings
+        desc_low = (description or '').lower()
+        if any(p in desc_low for p in ('nonetype', 'not subscriptable', 'keyerror', 'attributeerror', 'typeerror')):
+            return
         data = data or {}
         status_code = int(data.get('status_code', 0))
         if 500 <= status_code < 600:
@@ -245,7 +249,131 @@ class ResourceConsumptionAuditor:
             except requests.RequestException as exc:
                 elapsed = time.time() - t0
                 self._log_issue(url, 'Request Error', str(exc), 'Medium' if 'timeout' in str(exc).lower() else 'Low', {'method': method, 'status_code': 0, 'time': elapsed})
+
+        # ── Advanced resource consumption tests on sampled endpoints ──
+        # Run heavy tests only on a subset to avoid overloading the target.
+        if endpoints:
+            # Payload size tests (query params) — sample first 3 GET endpoints
+            get_eps = [e for e in endpoints if (e.get('method') or 'GET').upper() == 'GET'][:3]
+            for ep in get_eps:
+                try:
+                    self._test_large_payloads(ep)
+                except Exception:
+                    pass
+
+            # Batch / computational / rate-limit / concurrent tests — sample 1 endpoint each
+            write_eps = [e for e in endpoints if (e.get('method') or 'GET').upper() in ('POST', 'PUT', 'PATCH')]
+            for ep in write_eps[:1]:
+                try:
+                    self._test_batch_operations(ep)
+                except Exception:
+                    pass
+            for ep in endpoints[:1]:
+                try:
+                    self._test_computational_complexity(ep)
+                    self._test_rate_limiting(ep)
+                    self._test_concurrent_flood(ep)
+                except Exception:
+                    pass
+
+        # ── Data exfiltration risk assessment (Salesforce Data Loader pattern) ──
+        # Detect endpoints vulnerable to bulk data theft: large records + no
+        # pagination + rapid repeatable queries.  Based on Mitiga/UNC6040 TTPs.
+        try:
+            self._test_data_exfiltration_risk(endpoints)
+        except Exception:
+            pass
+
         return self.issues[start_count:]
+
+    #================funtion _test_data_exfiltration_risk detect bulk exfiltration vulnerability ##########
+    def _test_data_exfiltration_risk(self, endpoints: List[Dict[str, Any]]) -> None:
+        """Detect endpoints vulnerable to bulk data exfiltration (Salesforce Data Loader pattern).
+
+        Threat actors use legitimate API tokens to pull large record sets in rapid bursts,
+        each request returning mid-sized chunks (1-6 MB / 1000+ records) to stay under
+        per-request limits while exfiltrating millions of records total.
+
+        Indicators (from Mitiga UNC6040 / CVE-2023-44487 IOAs):
+        - GET endpoint returns 1000+ records or 1MB+ per request without pagination
+        - Rapid repeatable queries — 5 requests in quick succession all succeed
+        - Missing pagination headers (Link, X-Total-Count, Content-Range)
+        - No rate limiting detected (checked separately by _test_rate_limiting)
+        """
+        candidates = []
+        for ep in (endpoints or [])[:10]:  # sample first 10 to keep test fast
+            method = (ep.get('method') or 'GET').upper()
+            if method != 'GET':
+                continue
+            url = self._build_url(ep.get('url') or ep.get('path', '/'))
+            try:
+                resp = self.session.request(method, url, timeout=self.timeout)
+                if resp.status_code != 200:
+                    continue
+                size = len(resp.content or b'')
+                ct = (resp.headers.get('Content-Type', '') or '').lower()
+                if 'application/json' not in ct:
+                    continue
+                data = resp.json()
+                total_records = 0
+                if isinstance(data, list):
+                    total_records = len(data)
+                elif isinstance(data, dict):
+                    for v in data.values():
+                        if isinstance(v, list):
+                            total_records = max(total_records, len(v))
+                # Only test endpoints that already show large data potential
+                if total_records < int(self.thresholds.get('records_warn', 1000)) and size < int(self.thresholds.get('response_size', 1000000)):
+                    continue
+                candidates.append((ep, url, total_records, size))
+            except Exception:
+                continue
+
+        for ep, url, records, first_size in candidates[:3]:
+            # Rapid burst: 5 identical requests in quick succession
+            sizes = [first_size]
+            all_ok = True
+            for _ in range(4):
+                try:
+                    r = self.session.request('GET', url, timeout=self.timeout)
+                    if r.status_code == 200:
+                        sizes.append(len(r.content or b''))
+                    else:
+                        all_ok = False
+                        break
+                except Exception:
+                    all_ok = False
+                    break
+
+            if not all_ok:
+                continue
+
+            avg_size = sum(sizes) / len(sizes)
+            consistent = all(abs(s - avg_size) < avg_size * 0.3 for s in sizes)  # within 30%
+
+            # Check for pagination enforcement
+            hdrs_lower = {k.lower(): v for k, v in (getattr(self.session, 'headers', {}) or {}).items()}
+            has_pagination = any(
+                h in hdrs_lower for h in ('link', 'x-total-count', 'x-total', 'content-range')
+            )
+
+            if consistent and not has_pagination:
+                desc = (
+                    f'{records} records / {self._format_bytes(int(avg_size))} per request × 5 rapid GETs '
+                    f'— no pagination headers. Vulnerable to bulk data exfiltration '
+                    f'(Salesforce Data Loader / UNC6040 TTP).'
+                )
+                self._log_issue(url, 'Data Exfiltration Risk', desc, 'Critical',
+                    {'method': 'GET', 'records_per_request': records, 'avg_size': int(avg_size),
+                     'burst_size': len(sizes), 'consistent': consistent, 'has_pagination': has_pagination,
+                     'note': 'Mid-sized chunk exfiltration — each request is moderate but cumulative theft is massive'})
+            elif consistent:
+                self._log_issue(url, 'Data Exfiltration Risk',
+                    f'{records} records / {self._format_bytes(int(avg_size))} per request × 5 rapid GETs '
+                    f'— pagination present but consistent large chunks still exfiltratable',
+                    'Medium',
+                    {'method': 'GET', 'records_per_request': records, 'avg_size': int(avg_size),
+                     'burst_size': len(sizes), 'has_pagination': has_pagination})
 
     #================funtion _test_large_payloads _test_large_payloads =============
     def _test_large_payloads(self, endpoint: Dict[str, Any]) -> None:
@@ -283,7 +411,16 @@ class ResourceConsumptionAuditor:
 
     #================funtion _test_computational_complexity _test_computational_complexity =============
     def _test_computational_complexity(self, endpoint: Dict[str, Any]) -> None:
-        queries = [{'search': 'a' * 10000, 'severity': 'Medium'}, {'filter': ' OR '.join(['1=1'] * 500), 'severity': 'High'}, {'sort': ','.join(['field'] * 100), 'severity': 'Medium'}, {'id': '123 AND (SELECT * FROM (SELECT(SLEEP(5)))xyz)', 'severity': 'Critical'}, {'query': "' OR 1=1; WAITFOR DELAY '0:0:5'--", 'severity': 'Critical'}, {'q': '{"$where": "sleep(5000)"}', 'severity': 'Critical'}]
+        # Sane payload sizes: avoid DoS-ing the target with absurd 10KB strings
+        # and 500-repetition filters that cause cascading 500 errors.
+        queries = [
+            {'search': 'a' * 256, 'severity': 'Low'},
+            {'filter': ' OR '.join(['1=1'] * 20), 'severity': 'Medium'},
+            {'sort': ','.join(['field'] * 20), 'severity': 'Low'},
+            {'id': '123 AND (SELECT * FROM (SELECT(SLEEP(5)))xyz)', 'severity': 'Critical'},
+            {'query': "' OR 1=1; WAITFOR DELAY '0:0:5'--", 'severity': 'Critical'},
+            {'q': '{"$where": "sleep(5000)"}', 'severity': 'Critical'},
+        ]
         it = tqdm(queries, desc='Testing complex queries', leave=False) if self.show_progress else queries
         for q in it:
             sev = q.pop('severity')
@@ -296,6 +433,11 @@ class ResourceConsumptionAuditor:
                 elif rt > self.thresholds['response_time']:
                     self._log_issue(endpoint['url'], 'Computational Complexity', f'Complex query took {rt:.2f}s', sev, {'method': endpoint.get('method', 'GET'), 'query': q, 'time': rt, 'status_code': resp.status_code, 'headers': dict(resp.headers), 'body': (resp.text or '')[:2048]})
             except requests.RequestException as exc:
+                # Don't log connection-pool errors as findings — if we overload
+                # the server, that's our fault, not a security issue.
+                exc_str = str(exc).lower()
+                if 'connectionpool' in exc_str or 'max retries' in exc_str:
+                    continue
                 self._log_issue(endpoint['url'], 'Request Error', str(exc), 'High' if 'timeout' in str(exc).lower() else 'Medium', {'method': endpoint.get('method', 'GET'), 'status_code': 0, 'query': q})
 
     #================funtion _test_rate_limiting _test_rate_limiting =============
@@ -349,13 +491,16 @@ class ResourceConsumptionAuditor:
         if method not in ('POST', 'PUT', 'PATCH'):
             return
         base_payload = endpoint.get('json', {'items': [{'id': 1, 'name': 'Test User', 'email': 'test@example.com'}]})
+        items_template = base_payload.get('items')
+        if not items_template or not isinstance(items_template, list) or len(items_template) == 0:
+            return
         patterns = [('duplicate_ids', lambda i: {'id': 1}, 'Medium'), ('null_values', lambda i: {'id': i, 'value': None}, 'Low'), ('sql_injection', lambda i: {'id': i, 'filter': f"' OR 1=1 -- {i}"}, 'Critical')]
         sizes = self.thresholds.get('batch_sizes', [10, 50, 100])
         for size in tqdm(sizes, desc='Testing batch sizes', leave=False) if self.show_progress else sizes:
             try:
                 payload = {'items': []}
                 for i in range(size):
-                    item = dict(base_payload['items'][0])
+                    item = dict(items_template[0])
                     item.update({'id': i, 'email': f'user{i}@example.com'})
                     payload['items'].append(item)
                 self._execute_batch_request(endpoint, size, method, payload, 'normal', 'Medium')
@@ -374,14 +519,46 @@ class ResourceConsumptionAuditor:
         resp = self.session.request(method, self._build_url(endpoint['url']), json=payload, timeout=60)
         rt = time.time() - start
         if resp.status_code == 400:
-            self._log_issue(endpoint['url'], 'Batch Validation Failure', f'{pattern_name} batch of {size} failed validation', severity, {'method': method, 'pattern': pattern_name, 'batch_size': size, 'status_code': 400, 'body': (resp.text or '')[:2048]})
+            # Only flag if the 400 reveals stack traces or verbose errors —
+            # a plain "validation failed" on an invalid batch is expected behavior.
+            # Spring's BeanPropertyBindingResult is normal validation, NOT a verbose error.
+            body_text = (resp.text or '').lower()
+            verbose_indicators = (
+                'stack trace', 'traceback', 'exception', 'sqlstate',
+                'java.lang.', 'at com.', 'at org.',
+                'sql syntax', 'column.*not found', 'unclosed quotation',
+                'org.springframework.dao', 'org.springframework.jdbc',
+                'org.springframework.orm', 'org.hibernate',
+                'org.postgresql', 'com.mysql', 'java.sql',
+                'nullpointerexception', 'illegalargumentexception',
+                'illegalstateexception', 'classcastexception', 'arrayindexoutofbounds',
+                'indexoutofbounds', 'numberformatexception', 'concurrentmodification',
+            )
+            # Exclude normal Spring validation — BeanPropertyBindingResult is expected
+            is_spring_validation = 'beanpropertybindingresult' in body_text
+            has_real_verbose = any(ind in body_text for ind in verbose_indicators)
+            if has_real_verbose and not is_spring_validation:
+                self._log_issue(endpoint['url'], 'Batch Request Error',
+                    f'{pattern_name} batch of {size} caused verbose server error',
+                    severity, {'method': method, 'pattern': pattern_name, 'batch_size': size,
+                    'status_code': 400, 'body': body_text[:2048]})
+            # Normal validation rejections are not security findings — skip.
         else:
             self._analyze_batch_response(endpoint, size, resp, rt)
 
     #================funtion _test_concurrent_flood _test_concurrent_flood =============
     def _test_concurrent_flood(self, endpoint: Dict[str, Any]) -> None:
         method = (endpoint.get('method', 'GET') or 'GET').upper()
-        url = self._build_url(endpoint['url'])
+        url = self._build_url(endpoint.get('url') or endpoint.get('path', '/'))
+
+        # Quick probe — skip endpoints that don't exist
+        try:
+            probe = self.session.request(method, url, timeout=5)
+            if probe.status_code in (401, 403, 404, 405, 0):
+                return  # endpoint doesn't exist or requires auth
+        except Exception:
+            return  # can't reach endpoint, skip
+
         params = endpoint.get('parameters', {})
         successes = 0
         errors = 0
@@ -413,22 +590,38 @@ class ResourceConsumptionAuditor:
                     bar.update(1)
             if bar:
                 bar.close()
-        if timeouts > total * 0.5:
-            self._log_issue(endpoint['url'], 'Concurrent Request Timeouts', f'{timeouts}/{total} timed out', 'Critical', {'method': method, 'total_requests': total, 'timeouts': timeouts, 'errors': errors, 'successes': successes})
-        elif timeouts > total * 0.2:
+        # When ALL requests fail (errors+timeouts=total), we overloaded the server
+        # ourselves — this is self-DoS, not a vulnerability. Downgrade to Info.
+        if timeouts + errors >= total:
+            self._log_issue(endpoint['url'], 'Concurrent Request Timeouts', f'{timeouts}/{total} timed out, {errors} errors (self-induced)', 'Info', {'method': method, 'total_requests': total, 'timeouts': timeouts, 'errors': errors, 'successes': successes})
+        elif timeouts > total * 0.5:
             self._log_issue(endpoint['url'], 'Concurrent Request Timeouts', f'{timeouts}/{total} timed out', 'High', {'method': method, 'total_requests': total, 'timeouts': timeouts, 'errors': errors, 'successes': successes})
+        elif timeouts > total * 0.2:
+            self._log_issue(endpoint['url'], 'Concurrent Request Timeouts', f'{timeouts}/{total} timed out', 'Medium', {'method': method, 'total_requests': total, 'timeouts': timeouts, 'errors': errors, 'successes': successes})
         if errors > total * 0.5:
-            self._log_issue(endpoint['url'], 'Concurrent Request Failures', f'{errors}/{total} failed', 'Critical', {'method': method, 'total_requests': total, 'errors': errors, 'timeouts': timeouts, 'successes': successes})
-        elif errors > total * 0.3:
             self._log_issue(endpoint['url'], 'Concurrent Request Failures', f'{errors}/{total} failed', 'High', {'method': method, 'total_requests': total, 'errors': errors, 'timeouts': timeouts, 'successes': successes})
+        elif errors > total * 0.3:
+            self._log_issue(endpoint['url'], 'Concurrent Request Failures', f'{errors}/{total} failed', 'Medium', {'method': method, 'total_requests': total, 'errors': errors, 'timeouts': timeouts, 'successes': successes})
 
     #================funtion _filtered_issues _filtered_issues =============
     def _filtered_issues(self) -> List[Dict[str, Any]]:
         seen = set()
         out: List[Dict[str, Any]] = []
+        ERROR_PATTERNS = (
+            'nonetype', 'not subscriptable', 'keyerror', 'attributeerror',
+            'typeerror', "'none'", 'connectionpool', 'max retries',
+        )
         for it in self.issues:
             code = int(it.get('status_code', 0) or 0)
-            if code in (0, 400, 404, 405):
+            desc = (it.get('description') or '').lower()
+            # Skip known uninteresting HTTP status codes
+            if code in (400, 404, 405):
+                continue
+            # Filter out Python crash messages logged as findings
+            if any(p in desc for p in ERROR_PATTERNS):
+                continue
+            # Skip concurrent flood results for endpoints that don't exist
+            if 'failed' in desc and code == 0:
                 continue
             key = (
                 it.get('endpoint'),

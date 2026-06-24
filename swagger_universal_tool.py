@@ -1,8 +1,8 @@
 ########################################################
 # APISCAN - API Security Scanner                       #
 # Licensed under the AGPL-v3.0                         #
-# Author: Perry Mertens pamsniffer@gmail.com (C) 2025  #
-# version 4.0 26-04-2026                              #
+# Author: Perry Mertens pamsniffer@gmail.com (C) 2026  #
+# version 5.0 24-06-2026                               #
 ########################################################
 import argparse
 import json
@@ -41,9 +41,12 @@ API_CT_HINTS = JSON_CT_HINTS + (
 
 class UltimateSwaggerGenerator:
     #================funtion __init__ initialize generator, session and swagger skeleton ##########
-    def __init__(self, base_url: str, delay: float = 0.0, aggressive: bool = False):
+    def __init__(self, base_url: str, delay: float = 0.0, aggressive: bool = False, insecure: bool = False):
         self.base_url = base_url.rstrip('/')
         self.session = requests.Session()
+        self.session.verify = not insecure
+        if insecure:
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         self.delay = delay
         self.aggressive = aggressive
         self.session.headers.update({
@@ -103,7 +106,7 @@ class UltimateSwaggerGenerator:
         self.login_url = None
         self.login_data = None
         self.custom_headers = {}
-        self.log_path = "scan_log.ndjson"
+        self.log_path = os.path.join("log", "scan_log.ndjson")
 
                                                                
     #================funtion _mark_visited track visited URLs to avoid repeats ##########
@@ -543,6 +546,7 @@ class UltimateSwaggerGenerator:
             print(f"[+] API endpoint ({classification}): {clean_path}")
 
                            
+            os.makedirs(os.path.dirname(self.log_path) or ".", exist_ok=True)
             with open(self.log_path, "a", encoding="utf-8") as log:
                 log.write(json.dumps({
                     "url": url,
@@ -958,7 +962,7 @@ def main():
     args = parser.parse_args()
 
     try:
-        generator = UltimateSwaggerGenerator(args.url, delay=args.delay, aggressive=args.aggressive)
+        generator = UltimateSwaggerGenerator(args.url, delay=args.delay, aggressive=args.aggressive, insecure=args.insecure)
         generator.session = configure_authentication(args)
 
         if args.load_session:

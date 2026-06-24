@@ -1,0 +1,15 @@
+# APISCAN GUI - Extra dependencies for the graphical interface
+#
+# Tkinter (built-in on Windows/macOS):
+#   Windows/macOS: included with Python — no extra install needed
+#   Linux (Debian/Ubuntu): sudo apt install python3-tk
+#   Linux (Fedora/RHEL):   sudo dnf install python3-tkinter
+#   Linux (Arch):          sudo pacman -S tk
+#
+# All other modules are standard library (threading, subprocess, queue)
+#
+# Install base requirements:
+#   pip install -r requirements.txt
+#
+# Then run:
+#   python apiscan_gui.py

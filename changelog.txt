@@ -1,8 +1,50 @@
 # APISCAN - CHANGELOG
-Version:4.0 release 26-04-2026
+Version:5.0.0 release 24-06-2026
 Author: Perry Mertens pamsniffer@gmail.com
 
-26-04-2026
+24-06-2026 — v5.0.0 patch
+- All Python file headers unified to v5.0 with correct date (24-06-2026)
+- Documentation: index.html, index.md, README.md updated to v5.0.0
+- Documentation: screenshot lightbox (click to enlarge), crawl validate options documented
+- Documentation: CLI options expanded — crawl, crawl-depth, crawl-aggressive, crawl-passive, crawl-validate
+- Documentation: ShinyHunters & Salesforce attack pattern detection mentioned
+- Documentation: scan mode comparison table (Quick vs Deep) with endpoint/test counts
+- GUI: crawl validate options added (validate checkbox, mode combobox, workers entry)
+- GUI: Select All skips API11 (AI-assisted analysis runs separately)
+- GUI: TQDM_DISABLE=1 honored by safe_consumption_audit — ProgressBar fallback works in GUI
+- Safe Consumption: deep scan endpoint cap at 15 (APISCAN_DEEP_MAX_ENDPOINTS) to prevent 5-hour scans
+- Safe Consumption: quick_max_endpoints default raised from 20→30
+- Resource audit: NoneType crash fix — items check before subscript, error pattern filter in _log_issue
+- Resource audit: _filtered_issues no longer skips status_code=0 issues (rate limit/batch findings kept)
+- Resource audit: _test_data_exfiltration_risk wrapped in try/except
+- Swagger universal: scan_log.ndjson moved to log/ directory with auto-create
+- Headers consistent across all 24 active .py files
+
+23-06-2026 — v5.0.0 "Production Ready"
+- Version bump to 5.0.0 — stable and production-ready release
+- Form auto-login: standalone form_login.py module with HTML form + JSON API auto-detection
+- Form auto-login: BeautifulSoup-based field discovery, SPA detection, token auto-extraction
+- Form auto-login: crAPI (/identity/api/auth/login) and Juice Shop (/rest/user/login) support
+- GUI: new Form Login tab with Auto-Detect, 3-step cards, auto-switch to form flow
+- GUI: SPA detection skips HTML parsing for React/Angular apps
+- Crawl validator: detects Juice Shop "Unexpected path" 500 errors and filters fake endpoints
+- Crawl validator: SPA homepage detection, write-only endpoint GET probe, path-not-found regex patterns
+- Safe Consumption (API10): session retry fix — 500 responses returned as-is instead of MaxRetryError
+- Safe Consumption: deep scan auto-override — intensity=high, full payloads, no quick mode
+- Safe Consumption: quick scan expanded from 5→9 base tests and 2→6 injection types
+- Safe Consumption: quick max endpoints raised from 20→30
+- Safe Consumption: dict payloads made hashable for dedup (business logic, blind SQLi)
+- Misconfiguration: _tw error suppression for connectionpool/timeout noise during scan
+- Authorization: access denied severity lowered from MEDIUM→LOW (correct security behavior)
+- Resource audit: quick probe before flooding, error pattern filter for crash messages
+- Data leak detection: CORS analyzer detects large JSON arrays with sensitive fields → CRITICAL
+- CORS dedup: live output limited to 1 per category during scan
+- HTML response skip: form_login.py and GUI step 1b skip text/html to avoid matching web forms
+- --insecure flag passed through to swagger crawler for self-signed certs
+- Multiple crash fixes: circular import (auth_utils↔form_login), re vs _re, unhashable dict keys
+- Tested against Juice Shop (port 3000) and crAPI (port 8888) — clean scans, no crashes
+
+26-04-2026 — v4.0
 - Version bump to 4.0
 - Better scanner core with cleaner CLI output, startup banner, colored scan sections, and clearer finding messages
 - Modern LLM support: OpenAI GPT-5 aliases, o-series reasoning models, Claude 4.x, Gemini 2.5, OpenRouter, Azure OpenAI and OpenAI-compatible APIs

@@ -1,9 +1,10 @@
 ########################################################
 # APISCAN - API Security Scanner                       #
 # Licensed under the AGPL-v3.0                         #
-# Author: Perry Mertens pamsniffer@gmail.com (C) 2025  #
-# version 4.0 26-04-2026                              #
-########################################################  
+# Author: Perry Mertens pamsniffer@gmail.com (C) 2026  #
+# version 5.0 24-06-2026                               #
+########################################################
+  
                                                       
 from __future__ import annotations
 
@@ -621,8 +622,34 @@ class BusinessFlowAuditor:
             return  # Only test endpoints whose real body already contains a coupon/promo field
         payload = self._get_smart_body(original_body)
 
-        for _ in range(self.coupon_attempts):
-            coupon = "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
+        # Real-world weak/guessable coupon codes attackers try first.
+        # Includes: generic patterns, holidays, sequential, and common promo strings.
+        weak_coupons = [
+            "WELCOME", "WELCOME10", "WELCOME20", "WELCOME2025",
+            "SAVE10", "SAVE20", "SAVE50", "SAVE100",
+            "FREE", "FREESHIP", "FREESHIPPING",
+            "TEST", "TEST10", "TEST123", "TESTCOUPON",
+            "DISCOUNT", "DISCOUNT10", "DISCOUNT20", "DISCOUNT50",
+            "PROMO", "PROMO10", "PROMO20", "PROMO50",
+            "VIP", "VIP2024", "VIP2025",
+            "BLACKFRIDAY", "CYBERMONDAY", "XMAS", "XMAS2024",
+            "NEWYEAR", "EASTER", "SUMMER", "SUMMER2025",
+            "FLASH", "FLASH50", "MEGA", "MEGA20",
+            "THANKYOU", "LOYALTY",
+            "10OFF", "20OFF", "50OFF", "25OFF",
+            "GIFT10", "GIFT20", "GIFT50",
+            "FIRST", "FIRST10", "FIRSTORDER",
+            "0000", "1111", "1234", "9999",              # sequential/weak numeric
+        ]
+        # Add some numeric-progression attempts (1001-1005, 5001-5005)
+        for base in ("100", "500", "1000", "5000"):
+            for suffix in range(1, 6):
+                weak_coupons.append(base + str(suffix))
+
+        tested = 0
+        for coupon in weak_coupons:
+            if tested >= self.coupon_attempts:
+                break
             if coupon in self._tested_coupons:
                 continue
             self._tested_coupons.add(coupon)
@@ -632,7 +659,8 @@ class BusinessFlowAuditor:
             r = self._send(flow, body=attempt)
             if r is not None and self._is_processed(r):
                 self._log(flow, f"Coupon brute-force succeeded ({coupon_key}={coupon})", "High", resp=r, details={"payload": attempt})
-                break
+                return  # one success is enough — stop brute-forcing
+            tested += 1
 
                                                                                                
     #================funtion _test_rate_limit_sequential description =============

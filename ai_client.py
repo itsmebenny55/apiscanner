@@ -1,8 +1,8 @@
 ########################################################
-# APISCAN - AI Security Scanner Module                 #
+# APISCAN - API Security Scanner                       #
 # Licensed under the AGPL-v3.0                         #
 # Author: Perry Mertens pamsniffer@gmail.com (C) 2026  #
-# version 4.0 26-04-2026                              #
+# version 5.0 24-06-2026                               #
 ########################################################
 
 import os
@@ -181,6 +181,13 @@ Provide your answer ONLY as valid JSON with these fields:
   "confidence": <float between 0.0 and 1.0>,
   "cvss_score": <optional float between 0.0 and 10.0>
 }}
+
+Important rules:
+- Always return all required fields.
+- Never return "n/a" or an empty analysis.
+- If evidence is weak, return a best-effort assessment with risk="Informal" and low confidence.
+- Prefer the most likely OWASP category based on the observed evidence.
+- Mention concrete evidence from the response body, status code, headers, or auth comparison.
 """.strip()
 
 # ==================== CONFIGURATION CLASSES ====================
@@ -556,7 +563,11 @@ class LLMClient:
                 "top_p": top_p,
                 "max_tokens": max_tokens
             }
-            cache_key = hashlib.md5(json.dumps(cache_data, sort_keys=True).encode()).hexdigest()
+            # MD5 used only as a non-security cache lookup key; tag as such for SAST tools.
+            cache_key = hashlib.md5(
+                json.dumps(cache_data, sort_keys=True).encode(),
+                usedforsecurity=False,
+            ).hexdigest()
 
             with self._cache_lock:
                 if cache_key in self.cache:
@@ -653,8 +664,60 @@ class LLMClient:
             return result
             
         except requests.exceptions.RequestException as e:
+            if self.config.provider == "ollama":
+                response_obj = getattr(e, "response", None)
+                if response_obj is not None and response_obj.status_code == 404:
+                    logger.warning("Ollama /api/chat not available, retrying with /api/generate compatibility endpoint")
+                    try:
+                        return self._chat_ollama_generate_compat(
+                            messages=messages,
+                            system=system,
+                            model=model,
+                            temperature=temperature,
+                            top_p=top_p,
+                        )
+                    except requests.exceptions.RequestException as fallback_error:
+                        logger.error(f"Ollama fallback request failed: {fallback_error}")
+                        raise fallback_error
             logger.error(f"LLM request failed: {e}")
             raise
+
+    def _chat_ollama_generate_compat(self, messages: List[Dict[str, str]],
+                                     system: Optional[str], model: str,
+                                     temperature: float, top_p: float) -> str:
+        """Fallback for older Ollama servers that support /api/generate but not /api/chat."""
+        if self._cached_base_url is None:
+            self._cached_base_url = self._build_base_url()
+        base_url = self._cached_base_url
+
+        prompt_parts: List[str] = []
+        if system:
+            prompt_parts.append(f"System:\n{system}")
+        for msg in messages:
+            role = str(msg.get("role", "user")).strip().title()
+            content = str(msg.get("content", ""))
+            prompt_parts.append(f"{role}:\n{content}")
+        prompt_parts.append("Assistant:\n")
+        prompt = "\n\n".join(prompt_parts)
+
+        payload = {
+            "model": self._normalize_model_name(model or self.config.model),
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": temperature, "top_p": top_p}
+        }
+
+        session = self._get_session()
+        response = session.post(
+            f"{base_url}/api/generate",
+            headers=self._get_headers(),
+            json=payload,
+            timeout=self.config.timeout,
+            verify=self.config.verify_ssl,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return str(data.get("response", "") or "")
     
     def chat_json(self, messages: List[Dict[str, str]], system: Optional[str] = None,
                   model: Optional[str] = None, temperature: Optional[float] = None,
@@ -1267,6 +1330,77 @@ class APIScanner:
         """Check if HTTP method is potentially unsafe"""
         unsafe_methods = {"POST", "PUT", "PATCH", "DELETE"}
         return method.upper() in unsafe_methods
+
+    def _path_risk_hint(self, path: str, method: str) -> Dict[str, Any]:
+        """Return a conservative risk hint based on endpoint semantics."""
+        path_lower = (path or "").lower()
+        method_upper = (method or "GET").upper()
+
+        is_write = method_upper in {"POST", "PUT", "PATCH", "DELETE"}
+        auth_markers = ("auth", "login", "logout", "token", "password", "otp", "reset", "signup", "verify")
+        admin_markers = ("admin", "management", "role", "permission")
+        finance_markers = ("order", "coupon", "payment", "refund", "invoice", "wallet")
+        pii_markers = ("user", "profile", "email", "phone", "address", "vehicle")
+        upload_markers = ("upload", "picture", "video", "file")
+
+        if is_write and any(marker in path_lower for marker in auth_markers):
+            return {
+                "risk": RiskLevel.MEDIUM.value,
+                "owasp_category": "API2: Broken Authentication",
+                "explanation": "This is an authentication-related write endpoint and should be treated as higher-risk until actively validated.",
+                "recommendation": "Validate authentication hardening: brute-force controls, token lifecycle checks, and secure reset/OTP flows.",
+                "confidence": 0.46,
+                "cvss_score": 5.8,
+            }
+
+        if is_write and any(marker in path_lower for marker in admin_markers):
+            return {
+                "risk": RiskLevel.MEDIUM.value,
+                "owasp_category": "API5: Broken Function Level Authorization",
+                "explanation": "This appears to be an admin or privileged write endpoint with elevated authorization risk.",
+                "recommendation": "Enforce role checks server-side and test privilege boundaries across user roles.",
+                "confidence": 0.52,
+                "cvss_score": 6.2,
+            }
+
+        if is_write and any(marker in path_lower for marker in finance_markers):
+            return {
+                "risk": RiskLevel.MEDIUM.value,
+                "owasp_category": "API6: Unrestricted Access to Sensitive Business Flows",
+                "explanation": "This write endpoint looks tied to sensitive business actions and may be exposed to flow abuse.",
+                "recommendation": "Apply anti-automation controls and verify business flow constraints for replay, sequencing, and abuse.",
+                "confidence": 0.49,
+                "cvss_score": 5.9,
+            }
+
+        if is_write and any(marker in path_lower for marker in pii_markers):
+            return {
+                "risk": RiskLevel.MEDIUM.value,
+                "owasp_category": "API3: Broken Object Property Level Authorization",
+                "explanation": "This endpoint likely updates user-linked data and warrants property-level authorization checks.",
+                "recommendation": "Validate object/property ownership checks and prevent unauthorized field updates.",
+                "confidence": 0.44,
+                "cvss_score": 5.4,
+            }
+
+        if is_write and any(marker in path_lower for marker in upload_markers):
+            return {
+                "risk": RiskLevel.LOW.value,
+                "owasp_category": "API8: Security Misconfiguration",
+                "explanation": "This write endpoint handles uploaded content and should be reviewed for file handling controls.",
+                "recommendation": "Enforce content validation, size limits, MIME checks, and malware scanning for uploads.",
+                "confidence": 0.38,
+                "cvss_score": 4.2,
+            }
+
+        return {
+            "risk": RiskLevel.INFORMAL.value,
+            "owasp_category": "API8: Security Misconfiguration",
+            "explanation": "No strong path-based risk signal was detected.",
+            "recommendation": "Perform targeted testing with representative auth contexts.",
+            "confidence": 0.25,
+            "cvss_score": None,
+        }
     
     def probe_endpoint(self, session: requests.Session, base_url: str, method: str,
                        path: str, headers: Optional[Dict[str, str]] = None,
@@ -1348,10 +1482,20 @@ class APIScanner:
         if (scan_config.get("safe_mode", True) and 
             self._is_unsafe_method(method) and 
             not endpoint.get("allow_unsafe", False)):
+            hint = self._path_risk_hint(path, method)
+            skipped_analysis = AnalysisResult(
+                risk=hint["risk"],
+                explanation=f"{hint['explanation']} Endpoint not actively probed because safe mode blocks unsafe HTTP methods.",
+                owasp_category=hint["owasp_category"],
+                recommendation=f"{hint['recommendation']} Run API11 with safe mode disabled in a controlled test environment to confirm live behavior.",
+                reasoning="Method is considered unsafe for passive probing in safe mode, so the score is based on endpoint semantics rather than live response evidence.",
+                confidence=max(0.2, float(hint.get("confidence") or 0.2) - 0.08),
+                cvss_score=hint.get("cvss_score"),
+            )
             
             return ScanResult(
                 endpoint=endpoint,
-                analysis=None,
+                analysis=skipped_analysis,
                 probe=None,
                 probes_auth_comparison=None,
                 error=None,
@@ -1429,10 +1573,21 @@ class APIScanner:
                 result = self.llm.chat_json(messages, system=SYSTEM_PROMPT)
                 if isinstance(result, dict):
                     analysis = self._validate_analysis_result(result)
+                if analysis is None:
+                    analysis = self._build_fallback_analysis(
+                        endpoint,
+                        probes[0] if probes else None,
+                        probes_auth_comparison[0] if probes_auth_comparison else None,
+                    )
                 
             except Exception as e:
                 error = f"Analysis failed: {str(e)}"
                 logger.error(f"Analysis failed for {method} {path}: {e}")
+                analysis = self._build_fallback_analysis(
+                    endpoint,
+                    probes[0] if probes else None,
+                    probes_auth_comparison[0] if probes_auth_comparison else None,
+                )
         
         return ScanResult(
             endpoint=endpoint,
@@ -1473,6 +1628,7 @@ class APIScanner:
             prompt_prefix = [
                 "Analyze this observed API interaction for OWASP API Top 10 (2023) risks.",
                 "Use evidence only. If evidence is insufficient, say so explicitly.",
+                "Return a best-effort JSON object with a concrete risk score even when the endpoint looks safe.",
                 "",
                 f"Method: {method}",
                 f"Path: {path}",
@@ -1520,8 +1676,88 @@ class APIScanner:
             return (
                 f"Evaluate endpoint for OWASP API Top 10 (2023) risks. "
                 f"Base URL: {base_url} | Method: {method} | Path: {path}. "
-                f"Provide a security analysis based on common vulnerabilities for this type of endpoint."
+                f"Return a JSON object with risk, explanation, owasp_category, recommendation, reasoning, and confidence. "
+                f"If you are unsure, still provide a best-effort score instead of n/a."
             )
+
+    def _build_fallback_analysis(self, endpoint: EndpointDefinition,
+                                 probe: Optional[ProbeResult],
+                                 probe_noauth: Optional[ProbeResult]) -> AnalysisResult:
+        """Create a conservative, evidence-based fallback analysis when the LLM output is unusable."""
+        method = str(endpoint.get("method", "GET") or "GET").upper()
+        path = str(endpoint.get("path", "") or "")
+        hint = self._path_risk_hint(path, method)
+        body = (probe.response_text if probe else "") or ""
+        headers = {str(k).lower(): str(v) for k, v in (probe.response_headers or {}).items()} if probe else {}
+        status = probe.status_code if probe else 0
+        noauth_status = probe_noauth.status_code if probe_noauth else None
+        body_lower = body.lower()
+        path_lower = path.lower()
+
+        risk = hint["risk"]
+        category = hint["owasp_category"]
+        explanation = f"No strong AI result was returned, so this is a conservative evidence-based fallback assessment. {hint['explanation']}"
+        reasoning = [f"Observed status {status or 'n/a'} for {method} {path or '/'}."]
+        recommendation = f"{hint['recommendation']} Review the endpoint with an authenticated request and verify authorization, headers, and response content."
+        confidence = float(hint.get("confidence") or 0.25)
+        cvss = hint.get("cvss_score")
+
+        if any(h in headers for h in ("access-control-allow-origin", "access-control-allow-credentials")):
+            risk = RiskLevel.LOW.value
+            category = "API8: Security Misconfiguration"
+            explanation = "The response exposes CORS headers, which can expand browser-based access if misconfigured."
+            reasoning.append("CORS-related headers are present in the response.")
+            recommendation = "Restrict Access-Control-Allow-Origin to trusted origins and avoid wildcard CORS on sensitive routes."
+            confidence = 0.55
+        elif status in (401, 403) and probe_noauth and noauth_status in (200, 201, 204):
+            risk = RiskLevel.HIGH.value
+            category = "API2: Broken Authentication"
+            explanation = "The endpoint behaves differently with and without auth, suggesting access control or auth enforcement issues."
+            reasoning.append(f"Status with auth: {status}; status without auth: {noauth_status}.")
+            recommendation = "Enforce authentication consistently and verify that public and protected responses differ only by policy, not accidental exposure."
+            confidence = 0.78
+            cvss = 8.1
+        elif status in (200, 201, 202, 204) and (".env" in path_lower or "secret" in body_lower or "token" in body_lower):
+            risk = RiskLevel.HIGH.value
+            category = "API8: Security Misconfiguration"
+            explanation = "The response suggests sensitive configuration or secret material is exposed."
+            reasoning.append("The path or body contains sensitive-file/secret indicators.")
+            recommendation = "Remove sensitive files from the web root and ensure secrets are never returned by the API."
+            confidence = 0.9
+            cvss = 8.8
+        elif status in (200, 201, 202, 204) and ("auth" in path_lower or "login" in path_lower or "token" in path_lower or "reset" in path_lower):
+            risk = RiskLevel.MEDIUM.value
+            category = "API2: Broken Authentication"
+            explanation = "This looks like an authentication-related endpoint with successful access, so it deserves manual review."
+            reasoning.append("The endpoint path suggests authentication or token handling.")
+            recommendation = "Review brute-force protection, token validation, and authentication error handling."
+            confidence = 0.48
+            cvss = 5.6
+        elif status >= 500:
+            risk = RiskLevel.MEDIUM.value
+            category = "API8: Security Misconfiguration"
+            explanation = "The endpoint triggered a server error, which may indicate an unsafe edge case or unstable handler."
+            reasoning.append("A 5xx response was observed.")
+            recommendation = "Investigate the error path and add input validation plus safer error handling."
+            confidence = 0.62
+            cvss = 6.5
+        elif status in (200, 204):
+            risk = RiskLevel.LOW.value
+            category = "API8: Security Misconfiguration"
+            explanation = "The endpoint is reachable and returns a normal response, but no strong vulnerability evidence was extracted."
+            reasoning.append("A successful response was observed without a stronger signal.")
+            recommendation = "Confirm authorization, CORS, caching, and security headers for this endpoint."
+            confidence = 0.3
+
+        return AnalysisResult(
+            risk=risk,
+            explanation=explanation,
+            owasp_category=category,
+            recommendation=recommendation,
+            reasoning=" ".join(reasoning),
+            confidence=confidence,
+            cvss_score=cvss,
+        )
     
     def _validate_analysis_result(self, result: Dict[str, Any]) -> Optional[AnalysisResult]:
         """Validate and normalize analysis result from LLM"""
@@ -1605,6 +1841,10 @@ class APIScanner:
             logger.warning("Invalid max_workers value provided; falling back to 1")
             max_workers = 1
         if max_workers < 1:
+            max_workers = 1
+
+        if self.llm.config.provider == "ollama" and max_workers > 1:
+            logger.info("Ollama provider detected; forcing max_workers=1 for stable API11 analysis")
             max_workers = 1
         
         try:

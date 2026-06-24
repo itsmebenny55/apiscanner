@@ -1,9 +1,10 @@
 ########################################################
 # APISCAN - API Security Scanner                       #
 # Licensed under the AGPL-v3.0                         #
-# Author: Perry Mertens pamsniffer@gmail.com (C) 2025  #
-# version 4.0 26-04-2026                              #
-########################################################                                                    
+# Author: Perry Mertens pamsniffer@gmail.com (C) 2026  #
+# version 5.0 24-06-2026                               #
+########################################################
+                                                    
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Set
@@ -41,7 +42,7 @@ def _infer_base_url_from_spec(spec: Dict[str, Any]) -> str:
         if not u:
             continue
                                                                             
-        if u.startswith(("http://", "https://")):
+        if u.lower().startswith(("http://", "https://")):
             return u.rstrip("/") + "/"
     host = (spec or {}).get("host", "")
     base_path = (spec or {}).get("basePath", "/") or "/"
@@ -163,10 +164,38 @@ def _example_for_type(t: str, fmt: str = "") -> Any:
     return "test"
 
 
+#================funtion _resolve_ref resolve a $ref pointer within the spec ##########
+def _resolve_ref(spec: Dict[str, Any], ref: str) -> Dict[str, Any]:
+    """Follow a JSON $ref like '#/components/schemas/Order' and return the target schema."""
+    if not ref or not ref.startswith("#/"):
+        return {}
+    parts = ref[2:].split("/")
+    node = spec
+    for part in parts:
+        part = part.replace("~1", "/").replace("~0", "~")
+        if isinstance(node, dict):
+            node = node.get(part)
+        else:
+            return {}
+        if node is None:
+            return {}
+    if isinstance(node, dict):
+        # Resolve chained $ref
+        if "$ref" in node:
+            return _resolve_ref(spec, node["$ref"])
+        return node
+    return {}
+
+
 #================funtion _body_from_schema produce example body from JSON schema ##########
-def _body_from_schema(schema: Dict[str, Any]) -> Any:
+def _body_from_schema(schema: Dict[str, Any], spec: Optional[Dict[str, Any]] = None) -> Any:
     if not isinstance(schema, dict):
         return {}
+    # Resolve $ref before anything else (with circular-ref guard via simple recursion depth)
+    if "$ref" in schema and spec:
+        resolved = _resolve_ref(spec, schema["$ref"])
+        if resolved:
+            return _body_from_schema(resolved, spec)
     if "example" in schema:
         return schema["example"]
     t = schema.get("type")
@@ -188,7 +217,7 @@ def _body_from_schema(schema: Dict[str, Any]) -> Any:
         return out
     if t == "array":
         item_schema = schema.get("items", {}) or {}
-        return [_body_from_schema(item_schema)]
+        return [_body_from_schema(item_schema, spec)]
     return _example_for_type(t or "string", schema.get("format", ""))
 
                                                                              
@@ -276,22 +305,22 @@ def build_request(spec: dict, base_url: str | None, op: dict, cfg: "SecurityConf
                                                            
         if "application/json" in content:
             schema = content["application/json"].get("schema") or {}
-            json_body = _body_from_schema(schema)
+            json_body = _body_from_schema(schema, spec)
         elif "application/x-www-form-urlencoded" in content:
             schema = content["application/x-www-form-urlencoded"].get("schema") or {}
-            form = _body_from_schema(schema)
+            form = _body_from_schema(schema, spec)
             data_body = form if isinstance(form, dict) else {}
             headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
         elif "multipart/form-data" in content:
             schema = content["multipart/form-data"].get("schema") or {}
-            form = _body_from_schema(schema)
+            form = _body_from_schema(schema, spec)
             data_body = form if isinstance(form, dict) else {}
                                                                                             
         else:
                                                                  
             ctype, media = next(iter(content.items()))
             schema = (media or {}).get("schema") or {}
-            body = _body_from_schema(schema)
+            body = _body_from_schema(schema, spec)
             if "json" in ctype or isinstance(body, (dict, list)):
                 json_body = body
             else:
@@ -302,7 +331,7 @@ def build_request(spec: dict, base_url: str | None, op: dict, cfg: "SecurityConf
         body_param = next((p for p in params if (p.get("in") or "").lower() == "body"), None)
         if body_param:
             schema = (body_param.get("schema") or {})
-            body = _body_from_schema(schema)
+            body = _body_from_schema(schema, spec)
             json_body = body if isinstance(body, (dict, list)) else None
             data_body = None if json_body is not None else body
 

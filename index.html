@@ -4,13 +4,13 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta content="VvYq2k5BFp5dpIL6JpQhoe90sWEXZTEBbaynlEKCWRE" name="google-site-verification">
-  <meta name="description" content="APISCAN v4.0 AI-enhanced OWASP APIscanner by Perry Mertens" />
-  <meta property="og:title" content="APISCAN v4.0 OWASP APIScanner by Perry Mertens license AGPL-v3.0" />
-  <meta property="og:description" content="Extensible, AI-aware apiscanner for OWASP API Security Top 10 with Swagger/OpenAPI support, multiauth flows, and rich HTML reporting." />
+  <meta name="description" content="APISCAN v5.0.0 OWASP API Security Scanner by Perry Mertens" />
+  <meta property="og:title" content="APISCAN v5.0.0 OWASP API Security Scanner by Perry Mertens" />
+  <meta property="og:description" content="Production-ready OWASP API Security Top 10 scanner with auto form-login, crawl validation, deep scanning, and rich HTML reporting." />
   <meta property="og:type" content="website" />
   <meta property="og:image" content="./apiscan_logo.jpg" />
   <meta name="theme-color" content="#0ea5e9" />
-  <title>APISCAN v4.0 is an OWASP API scanner designed to detect API vulnerabilities</title>
+  <title>APISCAN v5.0.0 — OWASP API Security Scanner</title>
   <style>
     :root {
       --bg:      #0d1117;
@@ -174,6 +174,18 @@
       border: 1px solid var(--border);
     }
 
+    /* ── Lightbox overlay ── */
+    .lightbox-overlay {
+      display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      background: rgba(0,0,0,.88); z-index: 9999; justify-content: center;
+      align-items: center; cursor: pointer;
+    }
+    .lightbox-overlay.show { display: flex; }
+    .lightbox-overlay img {
+      max-width: 92vw; max-height: 92vh; border-radius: 8px;
+      box-shadow: 0 20px 60px rgba(0,0,0,.7);
+    }
+
     /* ── CLI options ── */
     .cli-table { width: 100%; border-collapse: collapse; }
     .cli-table td { padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 12.5px; vertical-align: top; }
@@ -239,13 +251,14 @@
       <div class="sidebar-logo-icon">A</div>
       <div>
         <div class="sidebar-logo-text">APISCAN</div>
-        <div class="sidebar-logo-sub">OWASP API Scanner v4.0</div>
+        <div class="sidebar-logo-sub">OWASP API Scanner v5.0.0</div>
       </div>
     </div>
     <div class="sidebar-nav">
       <div class="sidebar-nav-label">Overview</div>
       <ul>
         <li><a href="#whatsnew">What's New</a></li>
+        <li><a href="#gui">GUI &amp; Form Login</a></li>
         <li><a href="#install">Quick Start</a></li>
         <li><a href="#setup-tools">Setup &amp; AI</a></li>
         <li><a href="#features">Features</a></li>
@@ -277,7 +290,7 @@
     <div class="page-banner">
       <div>
         <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px;">
-          <span class="pill accent">v4.0</span>
+          <span class="pill accent">v5.0.0</span>
           <span class="pill">AI-aware · OWASP Top 10</span>
         </div>
         <h1>APISCAN — OWASP API Security Scanner</h1>
@@ -307,35 +320,70 @@
       </div>
     </section>
 
-    <section id="whatsnew">
-      <h2>What's New in v4.0</h2>
-      <div class="screenshot-wrap">
-        <img src="apiscan_v3_dashboard.jpg" alt="APISCAN v4.0 findings dashboard">
+    <!-- Screenshot Gallery -->
+    <section style="margin-bottom:40px;" id="screenshots">
+      <h2>GUI Overview</h2>
+      <p style="color:var(--muted);margin-bottom:20px;">Launch with <code>python apiscan_gui.py</code> — cross-platform Tkinter interface for Windows, macOS, and Linux.</p>
+      <div class="grid-auto" style="grid-template-columns:repeat(4,1fr);">
+        <figure style="margin:0;">
+          <img src="APISCAN-mainmenu%20v5.0.0.jpg" alt="Target tab — URL, Swagger, crawl settings, scan output"
+               style="width:100%;border-radius:var(--radius);border:1px solid var(--border);cursor:pointer;"
+               onclick="toggleLightbox(this)" loading="lazy">
+          <figcaption style="font-size:11px;color:var(--muted);margin-top:6px;text-align:center;">Target — URL, Swagger, Crawl</figcaption>
+        </figure>
+        <figure style="margin:0;">
+          <img src="APISCAN-Auth.jpg" alt="Authentication tab — Bearer, Basic, OAuth2, API Key, mTLS"
+               style="width:100%;border-radius:var(--radius);border:1px solid var(--border);cursor:pointer;"
+               onclick="toggleLightbox(this)" loading="lazy">
+          <figcaption style="font-size:11px;color:var(--muted);margin-top:6px;text-align:center;">Authentication — 7 auth flows</figcaption>
+        </figure>
+        <figure style="margin:0;">
+          <img src="APISCAN-loginform.jpg" alt="Form Login tab — Auto-Detect, credentials, token path"
+               style="width:100%;border-radius:var(--radius);border:1px solid var(--border);cursor:pointer;"
+               onclick="toggleLightbox(this)" loading="lazy">
+          <figcaption style="font-size:11px;color:var(--muted);margin-top:6px;text-align:center;">Form Login — Auto-Detect</figcaption>
+        </figure>
+        <figure style="margin:0;">
+          <img src="APISCAN-advance.jpg" alt="Advanced tab — threads, timeout, TLS, retry, debug"
+               style="width:100%;border-radius:var(--radius);border:1px solid var(--border);cursor:pointer;"
+               onclick="toggleLightbox(this)" loading="lazy">
+          <figcaption style="font-size:11px;color:var(--muted);margin-top:6px;text-align:center;">Advanced — Performance &amp; Network</figcaption>
+        </figure>
       </div>
+    </section>
+
+    <section id="whatsnew">
+      <h2>What's New in v5.0.0</h2>
       <div class="grid-auto">
         <article class="card">
-          <h3>Generic Sanitizer</h3>
-          <p>No customer hardcodes. Collapses duplicate path segments, normalizes <code>/vN</code>  <code>/vN.00</code>, trims trailing slashes. Toggle with <code>--no-sanitize</code> and refine with <code>--rewrite "pat=&gt;rep"</code>.</p>
+          <h3>Auto Form-Login</h3>
+          <p>Automatic login form detection for crAPI, Juice Shop, and custom apps. HTML form parsing, JSON API detection, token auto-extraction, and SPA-aware field discovery. GUI tab with one-click Auto-Detect.</p>
         </article>
         <article class="card">
-          <h3>Header Overrides</h3>
-          <p>Universal header model: <code>--flow token --token</code>, <code>--apikey --apikey-header</code>, <code>--extra-header</code>, <code>--headers-file</code>. Spec <em>examples/defaults</em> are autoapplied too.</p>
+          <h3>Crawl Validator</h3>
+          <p>Smart endpoint validation filters fake paths (Juice Shop "Unexpected path" errors, SPA fallbacks, 404 HTML pages). Keeps only real API endpoints — from 71→4 on Juice Shop.</p>
+          <p><code>--crawl</code> <code>--crawl-depth N</code> <code>--crawl-aggressive</code> <code>--crawl-passive</code><br>
+          <code>--crawl-validate</code> (on by default), <code>--no-crawl-validate</code>, <code>--crawl-validate-mode balanced|strict</code>, <code>--crawl-validate-workers N</code></p>
         </article>
         <article class="card">
-          <h3>IDs &amp; Samples</h3>
-          <p><code>--ids-file</code> to control path variables; fallback generator covers <code>*id</code>, <code>code</code>, <code>uuid</code>, <code>email</code>, <code>date</code>.</p>
+          <h3>Deep Scan Mode</h3>
+          <p><code>APISCAN_DEEP_SCAN=1</code> auto-switches to full payloads, high intensity, no quick mode. All injection types including SSTI, LDAP, XXE, RCE with <code>injection_payloads.json</code>.</p>
         </article>
         <article class="card">
-          <h3>Better Planning</h3>
-          <p>Improved requestBody sampling order and accurate JSON detection (<code>application/json; charset=UTF-8</code>).</p>
+          <h3>Expanded Quick Scan</h3>
+          <p>Default scan now covers 9 base tests + 6 injection types (SQL, Path, XSS, NoSQL, LFI, SSTI). Endpoint cap raised from 20→30 for better coverage without slowing down.</p>
         </article>
         <article class="card">
-          <h3>Enhanced Verification</h3>
-          <p>New <code>--verify-plan</code> option to test planned requests and <code>--success-codes</code> to define acceptable responses.</p>
+          <h3>Business Logic Testing</h3>
+          <p>New <code>_test_business_logic</code> detects negative prices, excessive discounts, admin role assignment, and privilege escalation via deep scan mode.</p>
         </article>
         <article class="card">
-          <h3>Adaptive Retry</h3>
-          <p><code>--retry500</code> option for automatic retries on HTTP 5xx errors with field augmentation from error messages.</p>
+          <h3>Production Ready</h3>
+          <p>Tested against Juice Shop and crAPI. Crash-free: dedup fix for dict payloads, session retry fix for 500 responses, HTML response skip in form detection, error spam suppression.</p>
+        </article>
+        <article class="card">
+          <h3>Real-World Attack Patterns</h3>
+          <p>Detects real-world threat actor TTPs: <strong>ShinyHunters</strong> unauthenticated data exposure (UNC6040), <strong>Salesforce</strong> enumeration &amp; Data Loader bulk exfiltration, plus many more attack patterns.</p>
         </article>
       </div>
     </section>
@@ -355,16 +403,15 @@ python apiscan.py --url https://api.example.com \
 
       <div class="grid-auto">
         <article class="card">
-          <h3>API10 quick mode is the default</h3>
-          <p>API10 (Unsafe Consumption of APIs) runs in quick mode by default. Quick mode keeps regular scans fast by limiting Phase 2 to the most promising endpoints and capping quick SQL testing.</p>
+          <h3>Quick scan (default)</h3>
+          <p>API10 (Unsafe Consumption of APIs) runs 9 base tests + 6 injection types by default on up to 30 endpoints. Fast and comprehensive for everyday use.</p>
           <ul>
             <li><code>APISCAN_API10_QUICK=1</code></li>
-            <li><code>APISCAN_API10_QUICK_MAX_ENDPOINTS=20</code></li>
+            <li><code>APISCAN_API10_QUICK_MAX_ENDPOINTS=30</code></li>
             <li><code>APISCAN_API10_QUICK_SQL_MAX_TESTS=10</code></li>
             <li><code>APISCAN_API10_QUICK_DIRTRAV_MAX_TESTS=8</code></li>
             <li><code>APISCAN_API10_QUICK_HPP_MAX_PARAMS=3</code></li>
             <li><code>APISCAN_API10_QUICK_REDIRECT_MAX_TESTS=6</code></li>
-            <li><code>APISCAN_RATE_LIMIT=0</code></li>
           </ul>
         </article>
         <article class="card">
@@ -388,6 +435,39 @@ export APISCAN_API10_QUICK=0
 
 # Bash/Linux/macOS: deep scan
 export APISCAN_DEEP_SCAN=1</code></pre>
+        </article>
+      </div>
+    </section>
+
+    <section id="gui">
+      <h2>GUI &amp; Form Auto-Login</h2>
+      <div class="grid-auto">
+        <article class="card">
+          <h3>Cross-Platform GUI</h3>
+          <p>Launch with <code>python apiscan_gui.py</code>. Tkinter-based interface with tabs for Scan Configuration, Authentication, Form Login, and Scans — works on Windows, macOS, and Linux.</p>
+        </article>
+        <article class="card">
+          <h3>Form Login Tab</h3>
+          <p>Three-step guided setup: Step 1 — where is the login page? Step 2 — enter credentials. Step 3 — configure token extraction path. Auto-switches auth flow to <code>form</code> when credentials are filled.</p>
+        </article>
+        <article class="card">
+          <h3>Auto-Detect</h3>
+          <p>Click <strong>Auto-Detect</strong> to let APISCAN find the login endpoint by probing common API paths (Juice Shop <code>/rest/user/login</code>, crAPI <code>/identity/api/auth/login</code>, and more). Detects JSON APIs, skips HTML web forms, and auto-extracts token paths.</p>
+        </article>
+        <article class="card">
+          <h3>Form Login via CLI</h3>
+          <pre><code># crAPI
+python apiscan.py --url http://127.0.0.1:8888 \
+  --swagger openapi.json \
+  --flow form \
+  --login-username user@email.com \
+  --login-password "Password123"
+
+# Juice Shop
+python apiscan.py --url http://192.168.168.132:3000 \
+  --crawl --flow form \
+  --login-username aa@aa.de \
+  --login-password "Banaan@+565"</code></pre>
         </article>
       </div>
     </section>
@@ -449,6 +529,7 @@ python test_env.py</code></pre>
           <h3>Authentication Support</h3>
           <p>Multiple authentication flows with flexible configuration:</p>
           <ul>
+            <li>Auto Form-Login (crAPI, Juice Shop)</li>
             <li>Bearer Token (JWT)</li>
             <li>OAuth2 Client Credentials</li>
             <li>OAuth2 Authorization Code</li>
@@ -504,6 +585,13 @@ python test_env.py</code></pre>
             <tr><td class="opt">--threads</td><td class="desc">Number of concurrent threads (default: 2)</td></tr>
             <tr><td class="opt">--debug</td><td class="desc">Enable debug output (verbose logging)</td></tr>
             <tr><td class="opt">--insecure</td><td class="desc">Disable TLS certificate validation</td></tr>
+            <tr><td class="opt">--crawl</td><td class="desc">Auto-discovery via HTTP crawling</td></tr>
+            <tr><td class="opt">--crawl-depth</td><td class="desc">Crawl link depth (default: 3, max: 10)</td></tr>
+            <tr><td class="opt">--crawl-aggressive</td><td class="desc">Aggressive crawl mode — follow all links</td></tr>
+            <tr><td class="opt">--crawl-passive</td><td class="desc">Passive crawl — only seed URL, no embedded links</td></tr>
+            <tr><td class="opt">--crawl-validate</td><td class="desc">Validate crawled endpoints (on by default; --no-crawl-validate to skip)</td></tr>
+            <tr><td class="opt">--crawl-validate-mode</td><td class="desc">Validator strictness: balanced (default) or strict</td></tr>
+            <tr><td class="opt">--crawl-validate-workers</td><td class="desc">Concurrent validator workers (default: 8)</td></tr>
           </table>
         </div>
 
@@ -541,6 +629,13 @@ python test_env.py</code></pre>
             <tr><td class="opt">--retry500</td><td class="desc">Adaptive retries on HTTP 5xx for POST/PUT/PATCH (default: 1)</td></tr>
             <tr><td class="opt">--no-retry-500</td><td class="desc">Disable adaptive 5xx retries</td></tr>
             <tr><td class="opt">--normalize-version</td><td class="desc">Normalize version segments, e.g. /v2.00/ → /v2.0/</td></tr>
+            <tr><td class="opt">--crawl</td><td class="desc">Auto-discovery via HTTP crawling (depth, aggressive, passive)</td></tr>
+            <tr><td class="opt">--crawl-depth</td><td class="desc">Crawl link depth (default: 3, max: 10)</td></tr>
+            <tr><td class="opt">--crawl-aggressive</td><td class="desc">Aggressive crawl mode — follow all links</td></tr>
+            <tr><td class="opt">--crawl-passive</td><td class="desc">Passive crawl — only seed URL, no embedded link following</td></tr>
+            <tr><td class="opt">--crawl-validate</td><td class="desc">Validate crawled endpoints (default: on). Use --no-crawl-validate to skip</td></tr>
+            <tr><td class="opt">--crawl-validate-mode</td><td class="desc">Validator strictness: balanced (default) or strict</td></tr>
+            <tr><td class="opt">--crawl-validate-workers</td><td class="desc">Concurrent validator workers (default: 8)</td></tr>
           </table>
         </div>
       </div>
@@ -863,6 +958,23 @@ python apiscan.py --url https://api.example.com --swagger ./openapi.json --plan-
       document.getElementById(tabId).classList.add('active');
       event.currentTarget.classList.add('active');
     }
+
+    function toggleLightbox(img) {
+      var overlay = document.getElementById('lightbox');
+      var lbImg = document.getElementById('lightbox-img');
+      if (overlay.classList.contains('show')) {
+        overlay.classList.remove('show');
+      } else {
+        lbImg.src = img.src;
+        overlay.classList.add('show');
+      }
+    }
   </script>
+
+  <!-- Lightbox overlay -->
+  <div id="lightbox" class="lightbox-overlay" onclick="this.classList.remove('show')">
+    <img id="lightbox-img" src="" alt="Enlarged screenshot">
+  </div>
+
 </body>
 </html>

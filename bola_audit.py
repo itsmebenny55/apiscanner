@@ -1,8 +1,8 @@
 ########################################################
 # APISCAN - API Security Scanner                       #
-# Licensed under the AGPL-v3.0 License                 #
+# Licensed under the AGPL-v3.0                         #
 # Author: Perry Mertens pamsniffer@gmail.com (C) 2026  #
-# version 4.0 26-04-2026                              #
+# version 5.0 24-06-2026                               #
 ########################################################
 
 from __future__ import annotations
@@ -174,7 +174,6 @@ class BOLAAuditor:
         self.max_retries = max_retries
         self.show_subbars = show_subbars
         self._max_workers = int(os.getenv('APISCAN_BOLA_WORKERS', '2'))
-        self.max_retries = 0
         self._shape_cache: Dict[str, str] = {}
 
         self.swagger_spec = swagger_spec or {}
@@ -506,6 +505,21 @@ class BOLAAuditor:
             op_params = op.get("parameters") or []
             all_params = list(path_params) + list(op_params)
 
+            # Fallback for crawl-discovered specs: extract path parameters directly
+            # from the URL template itself (e.g. /rest/basket/{id} -> param "id").
+            # Crawl-generated specs often embed parameters in the path but omit
+            # them from the operation's parameters list.
+            path_param_names = re.findall(r'\{([^}]+)\}', path)
+            existing_names = {p.get("name", "").lower() for p in all_params if isinstance(p, dict)}
+            for pname in path_param_names:
+                if pname.lower() not in existing_names:
+                    all_params.append({
+                        "name": pname,
+                        "in": "path",
+                        "required": True,
+                        "schema": {"type": "string"}
+                    })
+
             object_params = self._find_object_params(all_params)
 
             rb = (op.get("requestBody") or meta.get("requestBody")) if isinstance(meta, dict) else op.get("requestBody")
@@ -586,11 +600,21 @@ class BOLAAuditor:
             n = (n or "").lower()
             return any(k in n for k in ("id", "_id", "uuid", "key", "account", "user", "order"))
 
+        # Resolve type/format from either top-level (flattened by _find_object_params)
+        # or nested schema (raw OpenAPI param).
+        def _param_attr(p: dict, attr: str, default: str = "") -> str:
+            val = p.get(attr)
+            if val is not None and val != "":
+                return str(val).lower()
+            schema = p.get("schema", {}) or {}
+            val = schema.get(attr)
+            return str(val).lower() if val else default
+
         def pick_valid_for(p: dict) -> str:
             name = p.get("name", "")
             schema = p.get("schema", {}) or {}
-            fmt = (schema.get("format") or "").lower()
-            ptype = (schema.get("type") or "string").lower()
+            fmt = _param_attr(p, "format")
+            ptype = _param_attr(p, "type", "string")
             if seeds.get(name):
                 return str(seeds[name][0])
             for k in ("example", "default"):
@@ -628,9 +652,9 @@ class BOLAAuditor:
         nonexist = {}
         for p in parameters or []:
             name = p["name"]
-            schema = p.get("schema", {}) or {}
-            fmt = (schema.get("format") or "").lower()
-            if (schema.get("type") or "").lower() == "integer":
+            fmt = _param_attr(p, "format")
+            ptype = _param_attr(p, "type", "string")
+            if ptype == "integer":
                 nonexist[name] = "99999999"
             elif fmt == "uuid":
                 nonexist[name] = "00000000-0000-0000-0000-000000000000"

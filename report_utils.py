@@ -1,9 +1,10 @@
 ########################################################
 # APISCAN - API Security Scanner                       #
 # Licensed under the AGPL-v3.0                         #
-# Author: Perry Mertens pamsniffer@gmail.com (C) 2025  #
-# version 4.0 26-04-2026                              #
-########################################################                                   
+# Author: Perry Mertens pamsniffer@gmail.com (C) 2026  #
+# version 5.0 24-06-2026                               #
+########################################################
+                                   
 from __future__ import annotations
 from datetime import datetime
 import html
@@ -42,6 +43,14 @@ manual_file_map = {
 
 SEVERITY_ORDER = ["Critical", "High", "Medium", "Low", "Info"]
 _METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE"}
+_SENSITIVE_HEADER_NAMES = {
+    "authorization", "proxy-authorization", "cookie", "set-cookie",
+    "x-api-key", "api-key", "apikey", "x-auth-token", "x-access-token",
+    "x-amz-security-token",
+}
+_REDACTED = "***REDACTED***"
+_SENSITIVE_HEADER_LINE_RE = re.compile(r'(?im)^(authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key|apikey|x-auth-token|x-access-token)\s*:\s*.*$')
+_INLINE_BEARER_RE = re.compile(r'(?i)(authorization\s*:\s*bearer\s+)([A-Za-z0-9._\-~+/=]+)')
 
 def _split_method_endpoint(method: Any = None, endpoint: Any = None) -> tuple[str, str]:
     m = str(method or "").strip().upper()
@@ -76,6 +85,58 @@ def _iter_headers(hdrs):
         yield from hdrs
 
 
+def _redact_headers(hdrs: Any) -> Any:
+    if not hdrs:
+        return hdrs
+    if isinstance(hdrs, dict):
+        out = {}
+        for k, v in hdrs.items():
+            if str(k).lower() in _SENSITIVE_HEADER_NAMES:
+                out[k] = _REDACTED
+            else:
+                out[k] = v
+        return out
+    try:
+        out = []
+        for k, v in hdrs:
+            if str(k).lower() in _SENSITIVE_HEADER_NAMES:
+                out.append((k, _REDACTED))
+            else:
+                out.append((k, v))
+        return out
+    except Exception:
+        return hdrs
+
+
+def _redact_cookie_map(cookies: Any) -> Any:
+    if isinstance(cookies, dict):
+        return {k: _REDACTED for k in cookies.keys()}
+    return cookies
+
+
+def _redact_text_blob(text: Any) -> Any:
+    if not isinstance(text, str):
+        return text
+    s = _SENSITIVE_HEADER_LINE_RE.sub(lambda m: f'{m.group(1)}: {_REDACTED}', text)
+    return _INLINE_BEARER_RE.sub(lambda m: f'{m.group(1)}{_REDACTED}', s)
+
+
+def _redact_deep(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if str(k).lower() in _SENSITIVE_HEADER_NAMES:
+                out[k] = _REDACTED
+            else:
+                out[k] = _redact_deep(v)
+        return out
+    if isinstance(obj, list):
+        return [_redact_deep(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_redact_deep(v) for v in obj)
+    return _redact_text_blob(obj)
+
+
 class EnhancedReportGenerator:
     #================funtion __init__ initialize report generator and preprocess issues ##########
     def __init__(self, issues, scanner: str, base_url: str = "", **kwargs) -> None:
@@ -90,7 +151,22 @@ class EnhancedReportGenerator:
             # Keep High/Critical findings even when they have no HTTP response (status_code=0)
             _issues = [i for i in _issues if (_extract_status(i) or -1) > 0
                        or i.get('severity') in ('High', 'Critical')]
-        self.issues = _issues
+        self.issues = [self._sanitize_issue(i) for i in _issues]
+
+    #================funtion _sanitize_issue redact sensitive values before rendering ##########
+    def _sanitize_issue(self, issue: Any) -> Dict[str, Any]:
+        d = issue if isinstance(issue, dict) else {"raw": str(issue)}
+        safe = dict(d)
+        for k in ("request_headers", "response_headers", "headers", "req_headers", "res_headers"):
+            if k in safe:
+                safe[k] = _redact_headers(safe.get(k))
+        for k in ("response_cookies", "cookies"):
+            if k in safe:
+                safe[k] = _redact_cookie_map(safe.get(k))
+        for k in ("request", "payload", "request_body", "response_body", "response"):
+            if k in safe:
+                safe[k] = _redact_deep(safe.get(k))
+        return safe
 
     #================funtion _format_request_html render HTTP request panel in HTML ##########
     def _format_request_html(self, issue: Dict[str, Any]) -> str:

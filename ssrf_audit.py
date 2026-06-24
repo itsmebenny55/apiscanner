@@ -1,8 +1,8 @@
 ########################################################
 # APISCAN - API Security Scanner                       #
 # Licensed under the AGPL-v3.0                         #
-# Author: Perry Mertens pamsniffer@gmail.com (C) 2025  #
-# version 4.0 26-04-2026                              #
+# Author: Perry Mertens pamsniffer@gmail.com (C) 2026  #
+# version 5.0 24-06-2026                               #
 ########################################################
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import base64
 import html
 import json
 import logging
+import os
 import random
 import socket
 import threading
@@ -210,7 +211,17 @@ class SSRFAuditor:
     def endpoints_from_swagger(swagger_path: str | Path, *, default_base: str = "") -> List[Endpoint]:
         try:
             p = Path(swagger_path)
-            spec = json.loads(p.read_text(encoding="utf-8"))
+            raw = p.read_text(encoding="utf-8")
+            path_lower = str(swagger_path).lower()
+            if path_lower.endswith(('.yml', '.yaml')):
+                import yaml as _yaml
+                spec = _yaml.safe_load(raw) or {}
+            else:
+                try:
+                    spec = json.loads(raw)
+                except json.JSONDecodeError:
+                    import yaml as _yaml
+                    spec = _yaml.safe_load(raw) or {}
         except Exception as e:
             logger.error(f"Error reading Swagger file: {e}")
             return []
@@ -389,19 +400,31 @@ class SSRFAuditor:
         all_params = sorted([x for x in (swagger_params | common_params) if x and not self._should_exclude_param(x)])
 
         p_iter = tqdm(all_params, desc="params", unit="param", leave=False) if self.show_progress else all_params
+        # Limit SSRF probes to avoid combinatorial explosion:
+        # 397 endpoints × 11 params × 30 payloads × 5 encodings = 655K+ requests.
+        # Smart limiting: max 3 params, 4 payloads/param, 2 encodings.
+        max_params = int(os.environ.get('APISCAN_SSRF_MAX_PARAMS', '3'))
+        max_payloads = int(os.environ.get('APISCAN_SSRF_MAX_PAYLOADS', '4'))
+        max_encodings = int(os.environ.get('APISCAN_SSRF_MAX_ENCODINGS', '2'))
+        tested_params = 0
         for param in p_iter:
+            if tested_params >= max_params:
+                break
             payloads = list(self.PAYLOADS)
             random.shuffle(payloads)
+            payloads = payloads[:max_payloads]
+            encodings = self.CONFIG.encoding_types[:max_encodings]
             for payload in payloads:
-                for encoding in self.CONFIG.encoding_types:
+                for encoding in encodings:
                     encoded_payload = self._encode_payload(payload, encoding)
                     self._probe_params(ep, url_base, method, param, encoded_payload, encoding)
 
             if param in {"lang", "language", "locale", "v", "version"}:
-                for payload in self.LANG_PAYLOADS:
-                    for encoding in self.CONFIG.encoding_types:
+                for payload in self.LANG_PAYLOADS[:max_payloads]:
+                    for encoding in encodings:
                         encoded_payload = self._encode_payload(payload, encoding)
                         self._probe_params(ep, url_base, method, param, encoded_payload, encoding)
+            tested_params += 1
 
     #================funtion _probe_params send probes in query, body, headers, and path ##########
     def _probe_params(

@@ -1,9 +1,10 @@
 ########################################################
 # APISCAN - API Security Scanner                       #
 # Licensed under the AGPL-v3.0                         #
-# Author: Perry Mertens pamsniffer@gmail.com (C) 2025  #
-# version 4.0 26-04-2026                              #
-########################################################                                         
+# Author: Perry Mertens pamsniffer@gmail.com (C) 2026  #
+# version 5.0 24-06-2026                               #
+########################################################
+                                         
 from __future__ import annotations
 from typing import Any, Optional, Dict, List
 from urllib.parse import urljoin

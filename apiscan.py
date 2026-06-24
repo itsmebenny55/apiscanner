@@ -2,15 +2,9 @@
 # APISCAN - API Security Scanner                       #
 # Licensed under the AGPL-v3.0 License                 #
 # Author: Perry Mertens pamsniffer@gmail.com (C) 2026  #
-# version 4.0 26-04-2026                              #
+# version 5.0 24-06-2026                              #
 ########################################################
 
-"""APISCAN is a private and proprietary API security tool, developed independently for internal use and research purposes.
-It supports OWASP API Security Top 10 (2023) testing, OpenAPI-based analysis, active scanning, and multi-format reporting.
-Redistribution is not permitted without explicit permission.
-Important: Testing with APISCAN is only permitted on systems and APIs for which you have explicit authorization.
-Unauthorized testing is strictly prohibited.
-"""
 
 from __future__ import annotations
 try:
@@ -58,7 +52,11 @@ try:
     from ai_client import live_probe, analyze_endpoints_with_llm, save_ai_summary
 except ImportError:
     try:
-        from ai_client_v3 import live_probe, analyze_endpoints_with_llm, save_ai_summary
+        import importlib
+        _ai_v3 = importlib.import_module('ai_client_v3')
+        live_probe = getattr(_ai_v3, 'live_probe', None)
+        analyze_endpoints_with_llm = getattr(_ai_v3, 'analyze_endpoints_with_llm', None)
+        save_ai_summary = getattr(_ai_v3, 'save_ai_summary', None)
     except Exception:
         live_probe = None
         analyze_endpoints_with_llm = None
@@ -111,6 +109,184 @@ try:
 except Exception:
     pass
 
+# ================= SECURITY HARDENING HELPERS (OWASP) =====================
+# Centralised, defensive helpers used across the scanner.
+#  - Secret redaction in logs and error messages   (OWASP A09)
+#  - Strict file validation before opening user-supplied paths (A03/A08)
+#  - URL / filename sanitisation against traversal & control chars (A03)
+#  - Safe JSON loading with hard size limits (A03/A05 DoS)
+#  - Regex validation to mitigate ReDoS from --rewrite (A03)
+# These helpers are intentionally side-effect free.
+_MAX_JSON_FILE_BYTES = 16 * 1024 * 1024          # 16 MB hard cap on JSON inputs
+_MAX_SWAGGER_FILE_BYTES = 64 * 1024 * 1024       # 64 MB hard cap on Swagger spec
+_MAX_REWRITE_PATTERN_LEN = 512                   # cap regex length (ReDoS mitigation)
+_ALLOWED_PROXY_SCHEMES = {'http', 'https', 'socks5', 'socks5h', 'socks4', 'socks4a'}
+_SAFE_FILENAME_RE = _re.compile(r'[^A-Za-z0-9._-]+')
+_SENSITIVE_HEADER_NAMES = {
+    'authorization', 'proxy-authorization', 'cookie', 'set-cookie',
+    'x-api-key', 'x-auth-token', 'x-access-token', 'x-csrf-token',
+    'api-key', 'apikey', 'x-amz-security-token',
+}
+_SENSITIVE_QUERY_KEYS = {
+    'access_token', 'token', 'id_token', 'refresh_token', 'api_key',
+    'apikey', 'client_secret', 'password', 'pwd', 'secret', 'sig', 'signature',
+}
+
+_SENSITIVE_HEADER_LINE_RE = _re.compile(r'(?im)^(authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key|apikey|x-auth-token|x-access-token)\s*:\s*.*$')
+_INLINE_BEARER_RE = _re.compile(r'(?i)(authorization\s*:\s*bearer\s+)([A-Za-z0-9._\-~+/=]+)')
+
+
+def _redact_value(_v: object) -> str:
+    return '***REDACTED***'
+
+
+def _redact_headers(headers: object) -> dict:
+    if not isinstance(headers, dict):
+        return {}
+    out = {}
+    for k, v in headers.items():
+        try:
+            if str(k).lower() in _SENSITIVE_HEADER_NAMES:
+                out[k] = _redact_value(v)
+            else:
+                out[k] = v
+        except Exception:
+            out[k] = _redact_value(v)
+    return out
+
+
+def _redact_header_text_blob(text: object) -> str:
+    s = str(text or '')
+    s = _SENSITIVE_HEADER_LINE_RE.sub(lambda m: f'{m.group(1)}: ***REDACTED***', s)
+    return _INLINE_BEARER_RE.sub(lambda m: f'{m.group(1)}***REDACTED***', s)
+
+
+def _redact_headers_any(headers: object) -> object:
+    if isinstance(headers, dict):
+        return _redact_headers(headers)
+    if isinstance(headers, str):
+        return _redact_header_text_blob(headers)
+    try:
+        out = []
+        for item in headers or []:
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                k, v = item
+                if str(k).lower() in _SENSITIVE_HEADER_NAMES:
+                    out.append([k, '***REDACTED***'])
+                else:
+                    out.append([k, v])
+            else:
+                out.append(item)
+        return out
+    except Exception:
+        return headers
+
+
+def _redact_deep(obj: object) -> object:
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if str(k).lower() in _SENSITIVE_HEADER_NAMES:
+                out[k] = '***REDACTED***'
+            else:
+                out[k] = _redact_deep(v)
+        return out
+    if isinstance(obj, list):
+        return [_redact_deep(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_redact_deep(v) for v in obj)
+    if isinstance(obj, str):
+        return _redact_header_text_blob(obj)
+    return obj
+
+
+def _redact_url(url: str) -> str:
+    if not isinstance(url, str) or not url:
+        return ''
+    try:
+        from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+        parts = urlsplit(url)
+        netloc = parts.hostname or ''
+        if parts.port:
+            netloc = f'{netloc}:{parts.port}'
+        # Drop userinfo (user:pass@host) entirely
+        q_pairs = []
+        for k, v in parse_qsl(parts.query, keep_blank_values=True):
+            if k.lower() in _SENSITIVE_QUERY_KEYS:
+                q_pairs.append((k, _redact_value(v)))
+            else:
+                q_pairs.append((k, v))
+        new_q = urlencode(q_pairs, doseq=True)
+        return urlunsplit((parts.scheme, netloc, parts.path, new_q, ''))
+    except Exception:
+        return url
+
+
+def _sanitize_filename(name: str, fallback: str = 'target') -> str:
+    s = _SAFE_FILENAME_RE.sub('_', str(name or '')).strip('._-')
+    if not s:
+        s = fallback
+    return s[:120]
+
+
+def _validate_input_file(path: str | os.PathLike, max_bytes: int, label: str) -> Path:
+    if not path:
+        raise ValueError(f'{label}: no path provided')
+    p = Path(str(path)).expanduser().resolve()
+    if not p.exists():
+        raise FileNotFoundError(f'{label}: file not found: {p}')
+    if not p.is_file():
+        raise ValueError(f'{label}: not a regular file: {p}')
+    try:
+        size = p.stat().st_size
+    except OSError as e:
+        raise ValueError(f'{label}: cannot stat file: {e}') from e
+    if size == 0:
+        raise ValueError(f'{label}: file is empty')
+    if size > max_bytes:
+        raise ValueError(f'{label}: file too large ({size} > {max_bytes} bytes)')
+    return p
+
+
+def _safe_load_json_file(path: str | os.PathLike, label: str,
+                        max_bytes: int = _MAX_JSON_FILE_BYTES) -> Any:
+    p = _validate_input_file(path, max_bytes, label)
+    with p.open('r', encoding='utf-8') as fh:
+        return json.load(fh)
+
+
+def _validate_proxy(proxy: str) -> str:
+    if not proxy:
+        return ''
+    pr = proxy if '://' in proxy else f'http://{proxy}'
+    from urllib.parse import urlsplit
+    parts = urlsplit(pr)
+    if (parts.scheme or '').lower() not in _ALLOWED_PROXY_SCHEMES:
+        raise ValueError(f'unsupported proxy scheme: {parts.scheme!r}')
+    if parts.username or parts.password:
+        raise ValueError('proxy URL must not embed credentials; use env vars instead')
+    if not parts.hostname:
+        raise ValueError('proxy URL missing host')
+    return pr
+
+
+def _validate_rewrite_pattern(rule: str) -> str:
+    if not isinstance(rule, str) or '=>' not in rule:
+        raise ValueError('rewrite must be of form <regex>=><replacement>')
+    pat, _sep, rep = rule.partition('=>')
+    pat = pat.strip()
+    rep = rep.strip()
+    if not pat or len(pat) > _MAX_REWRITE_PATTERN_LEN:
+        raise ValueError('rewrite regex empty or too long')
+    try:
+        _re.compile(pat)
+    except _re.error as e:
+        raise ValueError(f'invalid rewrite regex: {e}') from e
+    return f'{pat}=>{rep}'
+
+
+# ==========================================================================
+
 OUT_DIR: Path | None = None
 DB = None
 manual_file_map = {'BOLA': 'bola', 'BrokenAuth': 'broken_auth', 'Property': 'property', 'Resource': 'resource', 'AdminAccess': 'admin_access', 'BusinessFlows': 'business_flows', 'SSRF': 'ssrf', 'Misconfig': 'misconfig', 'Inventory': 'inventory', 'UnsafeConsumption': 'unsafe_consumption'}
@@ -130,7 +306,26 @@ class EvidenceDatabase:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         except Exception:
             pass
-        self.conn = sqlite3.connect(self.path)
+        # Open with a sane timeout so concurrent writers don't deadlock silently.
+        self.conn = sqlite3.connect(str(self.path), timeout=30, isolation_level=None,
+                                    check_same_thread=False)
+        try:
+            cur = self.conn.cursor()
+            # Defensive pragmas (A05). secure_delete avoids leaving evidence
+            # fragments on disk; WAL improves resilience without weakening safety.
+            cur.execute('PRAGMA journal_mode=WAL')
+            cur.execute('PRAGMA synchronous=NORMAL')
+            cur.execute('PRAGMA secure_delete=ON')
+            cur.execute('PRAGMA foreign_keys=ON')
+            cur.execute('PRAGMA trusted_schema=OFF')
+        except Exception:
+            pass
+        # Restrict DB file to current user on POSIX.
+        try:
+            if os.name == 'posix' and self.path.exists():
+                os.chmod(self.path, 0o600)
+        except Exception:
+            pass
         self._init_schema()
 
     #================funtion _init_schema _init_schema =============
@@ -173,7 +368,7 @@ class EvidenceDatabase:
         from datetime import datetime as _dt
         now = _dt.utcnow().isoformat(timespec='seconds') + 'Z'
         import json as _json
-        rows = []
+        prepared = []
         for it in issues:
             d = it if isinstance(it, dict) else it.to_dict() if hasattr(it, 'to_dict') else {'raw': repr(it)}
             method = str(d.get('method') or d.get('http_method') or d.get('verb') or '').upper()
@@ -197,7 +392,75 @@ class EvidenceDatabase:
             req_body = d.get('payload') or d.get('request') or d.get('request_body') or ''
             res_headers = d.get('response_headers') or d.get('res_headers') or {}
             res_body = d.get('response_body') or d.get('res_body') or ''
-            rows.append((self.run_id, category, title, desc, category, str(sev).capitalize(), str(status), method, endpoint, _json.dumps(req_headers, ensure_ascii=False) if not isinstance(req_headers, str) else req_headers, _json.dumps(req_body, ensure_ascii=False) if isinstance(req_body, (dict, list)) else str(req_body), _json.dumps(res_headers, ensure_ascii=False) if not isinstance(res_headers, str) else res_headers, _json.dumps(res_body, ensure_ascii=False) if isinstance(res_body, (dict, list)) else str(res_body), sc if isinstance(sc, int) else None, now))
+            req_headers = _redact_headers_any(req_headers)
+            res_headers = _redact_headers_any(res_headers)
+            req_body = _redact_deep(req_body)
+            res_body = _redact_deep(res_body)
+            prepared.append({
+                'title': str(title),
+                'desc': str(desc),
+                'sev': str(sev).capitalize(),
+                'status': str(status),
+                'method': method,
+                'endpoint': endpoint,
+                'req_headers': _json.dumps(req_headers, ensure_ascii=False) if not isinstance(req_headers, str) else req_headers,
+                'req_body': _json.dumps(req_body, ensure_ascii=False) if isinstance(req_body, (dict, list)) else str(req_body),
+                'res_headers': _json.dumps(res_headers, ensure_ascii=False) if not isinstance(res_headers, str) else res_headers,
+                'res_body': _json.dumps(res_body, ensure_ascii=False) if isinstance(res_body, (dict, list)) else str(res_body),
+                'res_status': sc if isinstance(sc, int) else None,
+            })
+
+        deduped: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+        for item in prepared:
+            key = (
+                category.strip().lower(),
+                item['title'].strip().lower(),
+                item['sev'].strip().lower(),
+                item['endpoint'].strip().lower(),
+            )
+            if key not in deduped:
+                item['duplicate_count'] = 1
+                item['methods_seen'] = {item['method']} if item['method'] else set()
+                deduped[key] = item
+                continue
+            base = deduped[key]
+            base['duplicate_count'] = int(base.get('duplicate_count', 1)) + 1
+            if item.get('method'):
+                base.setdefault('methods_seen', set()).add(item['method'])
+            # Prefer a concrete HTTP status if one of the duplicates has it.
+            if base.get('res_status') in (None, 0) and item.get('res_status') not in (None, 0):
+                base['res_status'] = item.get('res_status')
+            # Keep richer textual evidence when available.
+            if len(str(item.get('res_body') or '')) > len(str(base.get('res_body') or '')):
+                base['res_body'] = item.get('res_body')
+
+        rows = []
+        for item in deduped.values():
+            dup_count = int(item.get('duplicate_count', 1))
+            methods_seen = sorted([m for m in item.get('methods_seen', set()) if m])
+            desc = item.get('desc', '')
+            if dup_count > 1:
+                methods_txt = ', '.join(methods_seen) if methods_seen else 'mixed'
+                suffix = f' [deduplicated {dup_count} similar findings; methods: {methods_txt}]'
+                if suffix not in desc:
+                    desc = (desc + suffix).strip()
+            rows.append((
+                self.run_id,
+                category,
+                item['title'],
+                desc,
+                category,
+                item['sev'],
+                item['status'],
+                item['method'],
+                item['endpoint'],
+                item['req_headers'],
+                item['req_body'],
+                item['res_headers'],
+                item['res_body'],
+                item['res_status'],
+                now,
+            ))
         cur = self.conn.cursor()
         cur.executemany('INSERT INTO finding(run_id, risk_key, title, description, category, severity, status, method, endpoint, req_headers, req_body, res_headers, res_body, res_status, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', rows)
 # Update endpoint.max_severity based on inserted findings for this category + run
@@ -216,70 +479,13 @@ class EvidenceDatabase:
                 FROM finding
                 WHERE run_id = ? AND category = ?
                 GROUP BY method, endpoint
-            """, (self.run_id, category))
-            rows2 = cur.fetchall()
-            rank_to_sev = {4: 'Critical', 3: 'High', 2: 'Medium', 1: 'Low', 0: 'Info'}
-            for mth, ep, max_rank in rows2:
-                if max_rank is None:
-                    continue
-                try:
-                    mr = int(max_rank)
-                except Exception:
-                    continue
-                if mr < 0:
-                    continue
-                sev2 = rank_to_sev.get(mr)
-                if not sev2:
-                    continue
-                self.record_endpoint(str(mth).upper(), str(ep), run_id=self.run_id, severity=sev2)
-        except Exception:
-            pass
-        self.conn.commit()  # deze in de gaten houden
-
-#================funtion close close =============
-    def close(self) -> None:
-        try:
-            self.conn.close()
+            """, (run_id, category))
         except Exception:
             pass
 
-#================funtion _guess_fill_for_key _guess_fill_for_key =============
-def _guess_fill_for_key(k):
-    kl = (k or '').lower()
-    if kl.endswith('id') or kl in ('id', 'user_id', 'order_id', 'vehicle_id', 'post_id'):
-        v = _pool_pick(kl, None)
-        return v if v is not None else 1
-    if kl in ('email', 'user_email', 'username'):
-        return _pool_pick(kl, None) or 'a@a.de'
-    if kl in ('token', 'otp', 'code', 'pin', 'coupon'):
-        return _pool_pick(kl, None) or '123456'
-    if 'qr' in kl:
-        return _pool_pick('qr', None) or _pool_pick('code', None) or '123456'
-    if any((s in kl for s in ('reason', 'message', 'comment', 'text', 'title', 'name'))):
-        return 'test'
-    return 'text'
-
-#================funtion _pool_pick _pool_pick =============
-def _pool_pick(key, default=None):
-    return default
-
-#================funtion _augment_body_missing_field_from_error _augment_body_missing_field_from_error =============
-def _augment_body_missing_field_from_error(body, rtext):
-    if not isinstance(body, dict):
-        return body
-    added = False
-    txt = rtext or ''
-    for m in MISSING_RE.finditer(txt):
-        fld = m.group(2)
-        if fld and fld not in body:
-            body[fld] = _guess_fill_for_key(fld)
-            added = True
-    return body
-
-#================funtion _normalize_version_in_url _normalize_version_in_url =============
+#================function _normalize_version_in_url description ##########
 def _normalize_version_in_url(u: str) -> str:
     try:
-
         #================funtion repl repl =============
         def repl(m):
             major = m.group(1)
@@ -296,9 +502,8 @@ def _sec_from_args(args) -> OASSecurityConfig:
     api_key_name = getattr(args, 'apikey_header', 'X-API-Key')
     return OASSecurityConfig(api_key_header_name=api_key_name, api_key_value=api_key_val, api_key_query_name=None, bearer_token=getattr(args, 'token', None))
 
-
+#================function _swagger_example_value description ##########
 def _swagger_example_value(param: dict) -> Any:
-    """Extract a concrete example/default value from a Swagger/OpenAPI parameter."""
     schema = (param or {}).get('schema') or {}
     if param.get('example') is not None:
         return param['example']
@@ -323,7 +528,6 @@ def _swagger_example_value(param: dict) -> Any:
 
 
 def _extract_path_params_from_parameters(parameters: list[dict] | None) -> dict[str, str]:
-    """Build path_params for AI scanning from Swagger/OpenAPI parameter metadata."""
     path_params: dict[str, str] = {}
     for param in parameters or []:
         if (param or {}).get('in') != 'path':
@@ -339,7 +543,6 @@ def _extract_path_params_from_parameters(parameters: list[dict] | None) -> dict[
 
 
 def _build_ai_endpoint(endpoint: dict) -> dict:
-    """Normalize an endpoint for ai_client while preserving Swagger-derived parameter values."""
     parameters = endpoint.get('parameters')
     if parameters is None:
         parameters = (endpoint.get('raw') or {}).get('parameters')
@@ -413,7 +616,6 @@ def styled_print(message: str, status: str='info') -> None:
 
 #================funtion print_banner print_banner =============
 def print_banner() -> None:
-    """Print a styled APISCAN startup banner."""
     try:
         from version import __version__ as _v
     except Exception:
@@ -445,7 +647,6 @@ def print_banner() -> None:
 
 #================funtion _scan_section _scan_section =============
 def _scan_section(num: int, title: str) -> None:
-    """Print a styled section divider for an API scan module."""
     C = Style.BRIGHT + Fore.CYAN
     W = Style.BRIGHT + Fore.WHITE
     D = Fore.CYAN
@@ -457,7 +658,6 @@ def _scan_section(num: int, title: str) -> None:
 
 #================funtion _scan_issue _scan_issue =============
 def _scan_issue(sev: str, desc: str, ep: str) -> None:
-    """Print a styled finding line (thread-safe via tqdm.write)."""
     _SEV = {
         'critical': Style.BRIGHT + Fore.RED,
         'high':     Style.BRIGHT + Fore.YELLOW,
@@ -472,9 +672,12 @@ def _scan_issue(sev: str, desc: str, ep: str) -> None:
 
 #================funtion _scan_err _scan_err =============
 def _scan_err(label: str, err: object) -> None:
-    """Print a compact, readable error line (thread-safe via tqdm.write)."""
     R  = Style.RESET_ALL
     msg = str(err)
+    # Suppress connection-pool noise from endpoints that don't exist
+    msg_low = msg.lower()
+    if any(k in msg_low for k in ('httpconnectionpool', 'max retries exceeded', 'failed to establish a new connection')):
+        return  # silent — endpoint doesn't exist, not a real error
     if 'timed out' in msg.lower() or 'timeout' in msg.lower():
         msg = 'Timeout'
     elif 'ConnectionError' in msg or 'Connection refused' in msg:
@@ -485,14 +688,34 @@ def _scan_err(label: str, err: object) -> None:
 
 #================funtion normalize_url normalize_url =============
 def normalize_url(url: str) -> str:
-    return url if url.startswith(('http://', 'https://')) else 'http://' + url
+    if not isinstance(url, str) or not url:
+        raise ValueError('URL must be a non-empty string')
+    if not url.lower().startswith(('http://', 'https://')):
+        url = 'https://' + url
+    if url.lower().startswith('http://'):
+        try:
+            styled_print(f'Using plaintext HTTP for {_redact_url(url)} - traffic is not encrypted', 'warn')
+        except Exception:
+            pass
+    return url
 
 #================funtion create_output_directory create_output_directory =============
 def create_output_directory(base_url: str) -> Path:
-    clean = base_url.replace('https://', '').replace('http://', '').replace('/', '_').replace(':', '_')
+    try:
+        from urllib.parse import urlsplit
+        host = urlsplit(base_url).netloc or base_url
+    except Exception:
+        host = base_url or 'target'
+    clean = _sanitize_filename(host, fallback='target')
     timestamp = datetime.now().strftime('%d-%m-%Y_%H%M%S')
-    out_dir = Path(f'audit_{clean}_{timestamp}')
-    out_dir.mkdir(exist_ok=True)
+    out_dir = Path.cwd() / f'audit_{clean}_{timestamp}'
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        # POSIX-only: restrict directory to current user.
+        if os.name == 'posix':
+            os.chmod(out_dir, 0o700)
+    except Exception:
+        pass
     return out_dir
 
 #================funtion save_html_report save_html_report =============
@@ -616,25 +839,27 @@ def _filter_auth_issues_min(issues):
 
 #================funtion check_api_reachable check_api_reachable =============
 def check_api_reachable(url: str, session: requests.Session, retries: int=3, delay: int=3) -> None:
+    safe_url = _redact_url(url)
     for attempt in range(1, retries + 1):
         try:
-            styled_print(f'Connecting to {url}  (attempt {attempt}/{retries})', 'run')
+            styled_print(f'Connecting to {safe_url}  (attempt {attempt}/{retries})', 'run')
             resp = session.get(url, timeout=5, verify=getattr(session, 'verify', True))
             code = resp.status_code
             if not resp.content:
                 styled_print('Empty response body from server', 'warn')
             if 200 <= code < 400 or code in (401, 403, 404, 405):
-                styled_print(f'Reachable  {Style.BRIGHT}{Fore.WHITE}{url}{Style.RESET_ALL}  →  HTTP {code}', 'ok')
+                styled_print(f'Reachable  {Style.BRIGHT}{Fore.WHITE}{safe_url}{Style.RESET_ALL}  →  HTTP {code}', 'ok')
                 return
-            styled_print(f'Unexpected HTTP {code} from {url}', 'warn')
+            styled_print(f'Unexpected HTTP {code} from {safe_url}', 'warn')
         except requests.exceptions.RequestException as e:
-            logger.error(f'Attempt {attempt} failed: {e}')
-            styled_print(f'Connection attempt {attempt} failed: {e}', 'warn')
+            # Avoid leaking secrets that may appear in URL/proxy/error text.
+            logger.error('Attempt %d failed: %s', attempt, type(e).__name__)
+            styled_print(f'Connection attempt {attempt} failed: {type(e).__name__}', 'warn')
         if attempt < retries:
             styled_print(f'Retrying in {delay}s ...', 'info')
             time.sleep(delay)
         else:
-            styled_print(f'Cannot reach {url} after {retries} attempts — aborting', 'fail')
+            styled_print(f'Cannot reach {safe_url} after {retries} attempts — aborting', 'fail')
             sys.exit(1)
 
 #================funtion load_id_map load_id_map =============
@@ -644,12 +869,15 @@ def load_id_map(path: str | None):
     if not path:
         return
     try:
-        import json as _json
-        from pathlib import Path as _Path
-        _ID_MAP = _json.loads(_Path(path).read_text(encoding='utf-8'))
+        data = _safe_load_json_file(path, label='ids-file')
+        if not isinstance(data, dict):
+            raise ValueError('ids-file must contain a JSON object')
+        # Coerce keys to str to avoid odd lookups; keep values as-is.
+        _ID_MAP = {str(k): v for k, v in data.items()}
         styled_print(f'Loaded IDs map with {len(_ID_MAP)} entries', 'info')
-    except Exception as e:
+    except (ValueError, FileNotFoundError, json.JSONDecodeError, OSError) as e:
         styled_print(f'Could not read ids-file: {e}', 'warn')
+        logger.warning('load_id_map failed: %s', e)
         _ID_MAP = {}
 
 #================funtion _id_lookup _id_lookup =============
@@ -738,13 +966,14 @@ def _merge_header_overrides(args) -> dict:
     hf = getattr(args, 'headers_file', None)
     if hf:
         try:
-            with open(hf, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                for k, v in data.items():
-                    put(k, v)
-        except Exception:
-            pass
+            data = _safe_load_json_file(hf, label='headers-file')
+            if not isinstance(data, dict):
+                raise ValueError('headers-file must contain a JSON object')
+            for k, v in data.items():
+                put(k, v)
+        except (ValueError, FileNotFoundError, json.JSONDecodeError, OSError) as e:
+            styled_print(f'Could not read headers-file: {e}', 'warn')
+            logger.warning('headers-file load failed: %s', e)
     return overrides
 
 #================funtion _parse_success_codes _parse_success_codes =============
@@ -1048,20 +1277,435 @@ def verify_plan(args, session, spec: dict, base_url: str, csv_path: str=None, re
         logger.debug('[VERIFY] CSV write failed: %s', e)
     return (oks, fails, total)
 
+def auto_generate_swagger(args, output_dir: Path | None=None) -> str:
+    from swagger_universal_tool import UltimateSwaggerGenerator
+    from datetime import datetime as _dt
+
+    timestamp = _dt.now().strftime('%Y%m%d_%H%M%S')
+    run_dir = Path(output_dir) if output_dir else Path.cwd()
+    log_dir = run_dir / 'log'
+    log_dir.mkdir(parents=True, exist_ok=True)
+    output_file = log_dir / f'swagger_auto_{timestamp}.json'
+
+    print(f'[*] No Swagger provided; starting crawl for {args.url}')
+    print(f'[*] Output: {output_file}')
+
+    effective_aggressive = bool(getattr(args, 'crawl_aggressive', False) or not getattr(args, 'crawl_passive', False))
+    if effective_aggressive and not getattr(args, 'crawl_aggressive', False):
+        print('[*] Crawl draait in aggressive modus (default). Gebruik --crawl-passive voor lichtere crawl.')
+
+    generator = UltimateSwaggerGenerator(
+        base_url=args.url,
+        delay=0.0,
+        aggressive=effective_aggressive,
+        insecure=bool(getattr(args, 'insecure', False))
+    )
+
+    # Forward auth options from apiscan args to crawler.
+    if getattr(args, 'token', None):
+        generator.set_token_auth(args.token)
+    if getattr(args, 'apikey', None):
+        header = getattr(args, 'apikey_header', 'X-API-Key')
+        generator.set_custom_header(header, args.apikey)
+
+    generator.crawl(
+        max_depth=getattr(args, 'crawl_depth', 3),
+        aggressive=effective_aggressive
+    )
+    generator._prune_non_json_paths()
+    generator.save_swagger(str(output_file))
+
+    if getattr(args, 'crawl_validate', True):
+        output_file = validate_crawled_swagger(str(output_file), args, output_dir=run_dir)
+
+    print(f'[+] Swagger generated: {output_file}')
+    return str(output_file)
+
+def validate_crawled_swagger(swagger_path: str, args, output_dir: Path | None=None) -> str:
+    from datetime import datetime as _dt
+
+    methods = {'get', 'head', 'options', 'post', 'put', 'patch', 'delete', 'trace'}
+
+    with open(swagger_path, 'r', encoding='utf-8') as f:
+        spec = json.load(f)
+
+    paths = (spec or {}).get('paths') or {}
+    if not isinstance(paths, dict) or not paths:
+        return swagger_path
+
+    try:
+        session = configure_authentication(args)
+    except Exception:
+        session = requests.Session()
+
+    try:
+        session.verify = not getattr(args, 'insecure', False)
+    except Exception:
+        pass
+
+    try:
+        if getattr(args, 'proxy', None):
+            session.proxies.update({'http': args.proxy, 'https': args.proxy})
+    except Exception:
+        pass
+
+    timeout = max(1.0, min(float(getattr(args, 'timeout', 5.0)), 10.0))
+    workers = max(1, int(getattr(args, 'crawl_validate_workers', 8) or 8))
+    mode = str(getattr(args, 'crawl_validate_mode', 'balanced') or 'balanced').strip().lower()
+
+    def _has_sample_response(path_item: dict[str, Any]) -> bool:
+        for k, op in (path_item or {}).items():
+            if not isinstance(k, str) or k.startswith('x-') or not isinstance(op, dict):
+                continue
+            responses = op.get('responses') or {}
+            if not isinstance(responses, dict):
+                continue
+            for _, resp in responses.items():
+                if not isinstance(resp, dict):
+                    continue
+                desc = str(resp.get('description') or '').lower()
+                content = resp.get('content') or {}
+                if content:
+                    return True
+                if desc and 'no sample response' not in desc:
+                    return True
+        return False
+
+    # Detect SPA homepages — cache the base URL response for comparison
+    _homepage_body: Optional[str] = None
+    _homepage_len: int = 0
+    try:
+        _hr = session.get(args.url, timeout=timeout, allow_redirects=True)
+        _hct = (getattr(_hr, 'headers', {}) or {}).get('Content-Type', '').lower()
+        if 'text/html' in _hct:
+            _homepage_body = getattr(_hr, 'text', '') or ''
+            _homepage_len = len(_homepage_body)
+    except Exception:
+        pass
+
+    # ── Helpers for detecting non-existent path errors ──
+    _PATH_NOT_FOUND_BODY = _re.compile(
+        r'unexpected\s+path', _re.IGNORECASE
+    )
+    _PATH_NOT_FOUND_JSON_MSG = _re.compile(
+        r'(?:unexpected|unknown|invalid|no\s+such|not\s+found|no\s+route)\s+(?:path|route|endpoint|url|resource)'
+        r'|cannot\s+(?:GET|POST|PUT|DELETE|PATCH)\b'  # Express "Cannot GET /…"
+        r'|no\s+route\s+found',  # Express "No route found for …"
+        _re.IGNORECASE
+    )
+    _NOT_FOUND_HTML_TITLE = _re.compile(
+        r'<title>[^<]*(?:404|not\s+found|page\s+not\s+found)[^<]*</title>',
+        _re.IGNORECASE
+    )
+
+    def _is_path_not_found_error(resp) -> bool:
+        if resp is None:
+            return False
+        try:
+            code = int(getattr(resp, 'status_code', 0) or 0)
+        except Exception:
+            return False
+        if code not in (500, 501):
+            return False
+        try:
+            ct = str((getattr(resp, 'headers', {}) or {}).get('Content-Type', '')).lower()
+        except Exception:
+            ct = ''
+        try:
+            body = getattr(resp, 'text', '') or ''
+        except Exception:
+            body = ''
+        body_low = body.lower()
+        body_short = body_low[:2048]
+
+        # Juice Shop: "Unexpected path: /api/whatever"
+        if _PATH_NOT_FOUND_BODY.search(body_short):
+            return True
+
+        # JSON error envelopes: {"error":{"message":"Unexpected path: ..."}}
+        if 'json' in ct and body_short:
+            try:
+                import json as _json
+                obj = _json.loads(body)
+            except Exception:
+                obj = None
+            if isinstance(obj, dict):
+                msg = str(obj.get('message', obj.get('error', ''))).lower()
+                if isinstance(obj.get('error'), dict):
+                    msg = str(obj['error'].get('message', '')).lower()
+                if _PATH_NOT_FOUND_JSON_MSG.search(msg):
+                    return True
+
+        # HTML 404-style pages served as 500
+        if 'text/html' in ct and _NOT_FOUND_HTML_TITLE.search(body_short):
+            return True
+
+        return False
+
+    def _probe(path: str, path_item: dict[str, Any]) -> tuple[str, bool]:
+        if not isinstance(path_item, dict):
+            return path, False
+
+        if mode == 'strict' and _has_sample_response(path_item):
+            return path, True
+
+        op_methods = []
+        for key in path_item.keys():
+            if isinstance(key, str) and key.lower() in methods:
+                op_methods.append(key.lower())
+
+        safe_methods = [m for m in ('get', 'head', 'options') if m in op_methods]
+        if not safe_methods:
+            # Write-only endpoint — probe with GET to see if the path exists at all
+            probe_url2 = urljoin(args.url.rstrip('/') + '/', _re.sub(r'\{[^}]+\}', '1', path).lstrip('/'))
+            try:
+                r = session.get(probe_url2, timeout=timeout, allow_redirects=False)
+                code = int(getattr(r, 'status_code', 0) or 0)
+                ct = str((getattr(r, 'headers', {}) or {}).get('Content-Type', '')).lower()
+                if code == 200 and 'text/html' in ct and _homepage_body:
+                    rb = getattr(r, 'text', '') or ''
+                    if len(rb) == _homepage_len and rb == _homepage_body:
+                        return path, False  # SPA fallback, not real
+                # 5xx "path not found" = endpoint doesn't exist
+                if _is_path_not_found_error(r):
+                    return path, False
+                if code in (401, 403, 405):
+                    return path, True  # exists but GET not allowed
+                if code == 200 and any(h in ct for h in ('json', 'xml', 'problem+json')):
+                    return path, True
+            except Exception:
+                pass
+            return path, False  # can't verify, drop it
+
+        probe_url = urljoin(args.url.rstrip('/') + '/', _re.sub(r'\{[^}]+\}', '1', path).lstrip('/'))
+        for m in safe_methods:
+            try:
+                resp = session.request(m.upper(), probe_url, timeout=timeout, allow_redirects=False)
+                code = int(getattr(resp, 'status_code', 0) or 0)
+                ct = str((getattr(resp, 'headers', {}) or {}).get('Content-Type', '')).lower()
+                body_len = len(getattr(resp, 'text', '') or '')
+            except Exception:
+                code = 0
+                ct = ''
+                body_len = 0
+
+            # 200 with HTML identical to homepage = SPA catch-all, not a real endpoint
+            if code == 200 and 'text/html' in ct and _homepage_body:
+                resp_body = getattr(resp, 'text', '') or ''
+                if len(resp_body) == _homepage_len and resp_body == _homepage_body:
+                    continue  # SPA fallback — try next method
+
+            # 5xx with "path not found" message = endpoint doesn't exist
+            if _is_path_not_found_error(resp):
+                continue  # try next method
+
+            if mode == 'strict':
+                if code in (200, 201, 202, 204, 401, 403, 405):
+                    if any(h in ct for h in ('json', 'xml', 'problem+json', 'vnd.api+json')) or body_len > 0:
+                        return path, True
+            else:
+                if code and code != 404:
+                    # In balanced mode, also skip SPA homepage matches
+                    if code == 200 and 'text/html' in ct and _homepage_body:
+                        resp_body = getattr(resp, 'text', '') or ''
+                        if len(resp_body) == _homepage_len and resp_body == _homepage_body:
+                            continue
+                    return path, True
+        return path, False
+
+    kept: dict[str, Any] = {}
+    dropped = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_probe, p, item) for p, item in paths.items()]
+        for fut in as_completed(futures):
+            p, ok = fut.result()
+            if ok:
+                kept[p] = paths[p]
+            else:
+                dropped += 1
+
+    if not kept:
+        print('[!] Crawl-validatie leverde 0 endpoints op; behoud originele crawl-output.')
+        return swagger_path
+
+    # ── BOLA enrichment: add {id} sibling for collection endpoints ──
+    # Crawls often discover /api/orders but not /api/orders/{id} because
+    # individual resource URLs may not be linked from list responses.
+    # Without {id} paths the BOLA scanner has no object parameters to test.
+    _enriched = dict(kept)
+    _resource_words = (
+        'order', 'item', 'product', 'user', 'basket', 'post', 'comment',
+        'message', 'review', 'feedback', 'account', 'profile', 'payment',
+        'address', 'category', 'group', 'file', 'event', 'log', 'notification',
+        'permission', 'role', 'setting', 'config', 'coupon', 'token', 'wallet',
+        'card', 'delivery', 'track', 'complaint', 'refund', 'report', 'invoice',
+    )
+    for path, path_item in kept.items():
+        if not isinstance(path_item, dict):
+            continue
+        # Skip paths that already have a path parameter
+        if '{' in path:
+            continue
+        # Check if the last segment suggests a resource collection
+        last_seg = path.rstrip('/').rsplit('/', 1)[-1].lower()
+        if not any(last_seg == w or last_seg == w + 's' for w in _resource_words):
+            continue
+        id_path = path.rstrip('/') + '/{id}'
+        if id_path in kept or id_path in _enriched:
+            continue
+        id_item: dict[str, Any] = {}
+        for method, op in path_item.items():
+            if not isinstance(method, str) or not isinstance(op, dict):
+                continue
+            m_upper = method.upper()
+            if m_upper not in ('GET', 'HEAD', 'OPTIONS'):
+                continue  # only safe read methods for auto-generated {id} paths
+            id_op = dict(op)
+            # Inject {id} path parameter
+            existing_params = list(id_op.get('parameters', []))
+            existing_names = {p.get('name') for p in existing_params if isinstance(p, dict)}
+            if 'id' not in existing_names:
+                existing_params.append({
+                    'name': 'id',
+                    'in': 'path',
+                    'required': True,
+                    'schema': {'type': 'integer'},
+                })
+            id_op['parameters'] = existing_params
+            id_op['summary'] = id_op.get('summary', '') + ' (auto-generated BOLA candidate)'
+            id_item[method] = id_op
+        if id_item:
+            _enriched[id_path] = id_item
+
+    spec['paths'] = _enriched
+    ts = _dt.now().strftime('%Y%m%d_%H%M%S')
+    run_dir = Path(output_dir) if output_dir else Path(swagger_path).resolve().parent.parent
+    log_dir = run_dir / 'log'
+    log_dir.mkdir(parents=True, exist_ok=True)
+    validated_path = log_dir / f'swagger_auto_validated_{ts}.json'
+    with open(validated_path, 'w', encoding='utf-8') as f:
+        json.dump(spec, f, indent=2, ensure_ascii=False)
+
+    enriched = len(_enriched) - len(kept)
+    print(f'[*] Crawl-validatie ({mode}): behouden={len(kept)} verwijderd={dropped} BOLA-enriched=+{enriched}')
+    print(f'[+] Validated Swagger written: {validated_path}')
+    return str(validated_path)
+
+def _count_spec_operations(spec: dict[str, Any] | None) -> int:
+    methods = {'get', 'post', 'put', 'patch', 'delete', 'head', 'options', 'trace'}
+    count = 0
+    paths = ((spec or {}).get('paths') or {}) if isinstance(spec, dict) else {}
+    for path_item in paths.values():
+        if not isinstance(path_item, dict):
+            continue
+        for key in path_item.keys():
+            if isinstance(key, str) and key.lower() in methods:
+                count += 1
+    return count
+
+def merge_swagger_specs(primary_swagger: str, crawled_swagger: str, output_dir: Path | None=None) -> str:
+    from datetime import datetime as _dt
+
+    with open(primary_swagger, 'r', encoding='utf-8') as f:
+        primary = json.load(f)
+    with open(crawled_swagger, 'r', encoding='utf-8') as f:
+        crawled = json.load(f)
+
+    primary_paths = primary.setdefault('paths', {})
+    crawled_paths = (crawled or {}).get('paths', {}) or {}
+    methods = {'get', 'post', 'put', 'patch', 'delete', 'head', 'options', 'trace'}
+
+    for path, path_item in crawled_paths.items():
+        if not isinstance(path_item, dict):
+            continue
+        if path not in primary_paths or not isinstance(primary_paths.get(path), dict):
+            primary_paths[path] = path_item
+            continue
+        for key, value in path_item.items():
+            if isinstance(key, str) and key.lower() in methods and key not in primary_paths[path]:
+                primary_paths[path][key] = value
+
+    timestamp = _dt.now().strftime('%Y%m%d_%H%M%S')
+    run_dir = Path(output_dir) if output_dir else Path(primary_swagger).resolve().parent.parent
+    log_dir = run_dir / 'log'
+    log_dir.mkdir(parents=True, exist_ok=True)
+    merged_file = log_dir / f'swagger_merged_{timestamp}.json'
+    with open(merged_file, 'w', encoding='utf-8') as f:
+        json.dump(primary, f, indent=2, ensure_ascii=False)
+
+    print(
+        '[*] Swagger merge: '
+        f'primary={_count_spec_operations(primary)} ops, '
+        f'crawled={_count_spec_operations(crawled)} ops, '
+        f'merged={_count_spec_operations(primary)} ops'
+    )
+    print(f'[+] Merged Swagger written: {merged_file}')
+    return str(merged_file)
+
 #================funtion main main =============
 def main() -> None:
     parser = argparse.ArgumentParser(description=f'APISCAN {__version__} - API Security Scanner')
     parser.add_argument('--url', required=True, help='Base URL of the API to scan')
-    parser.add_argument('--swagger', required=True, help='Path to Swagger/OpenAPI JSON file')
+    parser.add_argument('--swagger', help='Path to Swagger/OpenAPI JSON file (optional with --crawl)')
+    parser.add_argument(
+        '--crawl',
+        action='store_true',
+        help='Auto-generate Swagger spec by crawling target before scanning'
+    )
+    parser.add_argument(
+        '--crawl-depth',
+        type=int,
+        default=3,
+        help='Crawl depth for auto-discovery (default: 3)'
+    )
+    parser.add_argument(
+        '--crawl-aggressive',
+        action='store_true',
+        help='Enable aggressive crawl mode (brute-force common endpoints)'
+    )
+    parser.add_argument(
+        '--crawl-passive',
+        action='store_true',
+        help='Disable default aggressive crawl behavior and use lighter discovery only'
+    )
+    parser.add_argument(
+        '--crawl-validate',
+        dest='crawl_validate',
+        action='store_true',
+        help='Validate discovered crawl endpoints with lightweight probes (default: on)'
+    )
+    parser.add_argument(
+        '--no-crawl-validate',
+        dest='crawl_validate',
+        action='store_false',
+        help='Skip post-crawl endpoint validation'
+    )
+    parser.add_argument(
+        '--crawl-validate-workers',
+        type=int,
+        default=8,
+        help='Concurrent workers for post-crawl validation probes (default: 8)'
+    )
+    parser.add_argument(
+        '--crawl-validate-mode',
+        choices=['balanced', 'strict'],
+        default='balanced',
+        help='Validation strictness after crawl: balanced (default) or strict'
+    )
     parser.add_argument('--threads', type=int, default=16, help='Number of concurrent threads to use (default: 16)')
     parser.add_argument('--db-path', help='Optional SQLite DB file to cache findings')
     parser.add_argument('--plan-only', action='store_true', help='Build all requests and write apiscan-plan.csv, do not send')
     parser.add_argument('--plan-then-scan', action='store_true', help='First build full plan (CSV), then perform the scan')
     parser.add_argument('--verify-plan', action='store_true', help='After planning, actually send each planned request and expect success')
     parser.add_argument('--success-codes', default='200-299', help='Comma list of codes or ranges, e.g., 200-299,302')
-    parser.add_argument('--flow', choices=['none', 'token', 'client', 'basic', 'digest', 'ntlm', 'auth'], default='none', help='Authentication flow: none, token (Bearer), client (OAuth2 Client Credentials), basic (Basic Auth), digest (HTTP Digest), ntlm (Windows NTLM), auth (OAuth2 Authorization Code)')
+    parser.add_argument('--flow', choices=['none', 'token', 'client', 'basic', 'digest', 'ntlm', 'auth', 'form'], default='none', help='Authentication flow: none, token (Bearer), client (OAuth2 Client Credentials), basic (Basic Auth), digest (HTTP Digest), ntlm (Windows NTLM), auth (OAuth2 Authorization Code), form (auto-detect login form)')
     parser.add_argument('--token', help='Bearer token value (used with --flow token)')
     parser.add_argument('--basic-auth', help='Basic auth in the form user:password (used with --flow basic)')
+    # Auto form-login arguments
+    parser.add_argument('--login-url', help='Login page/endpoint URL (for --flow form)')
+    parser.add_argument('--login-username', help='Username or email for auto form-login (for --flow form)')
+    parser.add_argument('--login-password', help='Password for auto form-login (for --flow form)')
+    parser.add_argument('--token-path', help='JSON dot-path to token in login response, e.g. authentication.token (for --flow form)')
     parser.add_argument('--apikey', help='API key value (sent in header specified by --apikey-header)')
     parser.add_argument('--apikey-header', default='X-API-Key', help='Header name for API key (default: X-API-Key)')
     parser.add_argument('--ntlm', help='NTLM credentials in the form DOMAIN\\user:password (used with --flow ntlm)')
@@ -1075,7 +1719,7 @@ def main() -> None:
     parser.add_argument('--redirect-uri', help='Redirect URI for OAuth2 Authorization Code flow')
     parser.add_argument('--scope', help='OAuth2 scope(s), space-separated')
     parser.add_argument('--insecure', action='store_true', help='Disable TLS certificate validation (DANGEROUS, use only for testing)')
-    parser.add_argument('--timeout', type=int, default=5.0, help='Request timeout in seconds')
+    parser.add_argument('--timeout', type=float, default=5.0, help='Request timeout in seconds (float, 0 < t <= 600)')
     parser.add_argument('--retry500', type=int, default=1, help='adaptive retries on HTTP 5xx for POST/PUT/PATCH')
     parser.add_argument('--no-retry-500', dest='retry500', action='store_const', const=0, help='disable adaptive 5xx retries')
     parser.add_argument('--debug', action='store_true', help='Enable debug output (verbose logging)')
@@ -1093,7 +1737,7 @@ def main() -> None:
     group_nv = parser.add_mutually_exclusive_group()
     group_nv.add_argument('--normalize-version', dest='normalize_version', action='store_true', help='Normalize version segments in URLs like /v2.00/ -> /v2.0/ during planning and verify.')
     group_nv.add_argument('--no-normalize-version', dest='normalize_version', action='store_false', help='Disable version normalization in URLs (default).')
-    parser.set_defaults(normalize_version=False)
+    parser.set_defaults(normalize_version=False, crawl_validate=True)
     # Normalize argument names to lowercase so --URL, --Token, --Swagger etc. all work
     _argv = []
     for _a in sys.argv[1:]:
@@ -1105,9 +1749,46 @@ def main() -> None:
         _argv.append(_a)
     args = parser.parse_args(_argv)
     builtins.args = args
-    if args.url and '://' not in args.url:
-        args.url = 'http://' + args.url
-    args.url = normalize_url(args.url)
+    # --- Hardened argument validation (OWASP A03/A05) ---
+    try:
+        if not isinstance(args.timeout, (int, float)) or args.timeout <= 0 or args.timeout > 600:
+            parser.error('--timeout must be > 0 and <= 600 seconds')
+        if getattr(args, 'crawl_depth', 3) < 1:
+            parser.error('--crawl-depth must be >= 1')
+        if getattr(args, 'crawl_validate_workers', 8) < 1:
+            parser.error('--crawl-validate-workers must be >= 1')
+        if getattr(args, 'rewrite', None):
+            args.rewrite = [_validate_rewrite_pattern(r) for r in args.rewrite]
+        if getattr(args, 'proxy', None):
+            args.proxy = _validate_proxy(args.proxy)
+        for _label, _attr, _cap in (
+            ('client-cert', 'client_cert', _MAX_JSON_FILE_BYTES),
+            ('client-key',  'client_key',  _MAX_JSON_FILE_BYTES),
+            ('headers-file', 'headers_file', _MAX_JSON_FILE_BYTES),
+            ('ids-file',     'ids_file',     _MAX_JSON_FILE_BYTES),
+        ):
+            _val = getattr(args, _attr, None)
+            if _val:
+                _validate_input_file(_val, _cap, _label)
+    except (ValueError, FileNotFoundError) as e:
+        parser.error(str(e))
+    if args.url:
+        # normalize_url enforces https-by-default and warns on http://.
+        args.url = normalize_url(args.url)
+    output_dir = create_output_directory(args.url)
+    if args.crawl:
+        if args.swagger:
+            print('[*] Zowel --swagger als --crawl opgegeven; crawl wordt toegevoegd aan bestaande swagger.')
+            crawled_swagger = auto_generate_swagger(args, output_dir=output_dir)
+            try:
+                args.swagger = merge_swagger_specs(args.swagger, crawled_swagger, output_dir=output_dir)
+            except Exception as e:
+                print(f'[!] Merge mislukt ({e}); ga verder met opgegeven --swagger.')
+        else:
+            args.swagger = auto_generate_swagger(args, output_dir=output_dir)
+    elif not args.swagger:
+        print('[-] Geef --swagger op of gebruik --crawl voor auto-discovery')
+        sys.exit(1)
     clear_screen()
     print_banner()
     if getattr(args, 'dummy', False):
@@ -1125,7 +1806,6 @@ def main() -> None:
     else:
         logging.basicConfig(level=logging.INFO, format='[INFO] %(message)s')
     selected_apis = [11] if args.api11 else [i for i in range(1, 11) if getattr(args, f'api{i}')] or list(range(1, 11))
-    output_dir = create_output_directory(args.url)
     global OUT_DIR
     OUT_DIR = output_dir
     if not getattr(args, 'db_path', None):
@@ -1182,12 +1862,15 @@ def main() -> None:
     try:
         if args.insecure:
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            # Prominent operator-visible warning (OWASP A02).
+            styled_print('TLS certificate validation is DISABLED (--insecure). Use only against test systems.', 'warn')
+            logger.warning('TLS certificate validation disabled by user (--insecure)')
     except Exception:
         pass
     if getattr(args, 'proxy', None):
-        pr = args.proxy if '://' in args.proxy else f'http://{args.proxy}'
+        pr = args.proxy  # already validated above
         sess.proxies.update({'http': pr, 'https': pr})
-        banner = f'PROXY MODE ENABLED -> {pr}'
+        banner = f'PROXY MODE ENABLED -> {_redact_url(pr)}'
         logger.info(banner)
         try:
             print(Fore.MAGENTA + banner + Style.RESET_ALL)
@@ -1207,8 +1890,11 @@ def main() -> None:
             raise FileNotFoundError(f'Swagger file not found: {swagger_path}')
         if not swagger_path.is_file():
             raise ValueError(f'Path is not a file: {swagger_path}')
-        if swagger_path.stat().st_size == 0:
+        _sz = swagger_path.stat().st_size
+        if _sz == 0:
             raise ValueError('Swagger file is empty')
+        if _sz > _MAX_SWAGGER_FILE_BYTES:
+            raise ValueError(f'Swagger file too large ({_sz} > {_MAX_SWAGGER_FILE_BYTES} bytes)')
         logger.info(f'Loading Swagger from: {swagger_path}')
         styled_print(f'Loading validated Swagger file: {swagger_path}', 'info')
         spec = oas_load_spec(str(swagger_path), inject_base_url=args.url)
@@ -1416,20 +2102,31 @@ def main() -> None:
         styled_print(f'API6 complete - {len(biz_issues)} issues', 'done')
     
     if 7 in selected_apis:
-        _scan_section(7, 'Server Side Request Forgery')
-        logger.info('Running API7 - SSRF')
-        ss_eps = SSRFAuditor.endpoints_from_swagger(args.swagger, default_base=args.url)
-        if ss_eps:
-            ss = SSRFAuditor(session=sess, base_url=args.url, swagger_spec=spec)
-            ssrf_issues = ss.test_endpoints(ss_eps)
-            vulnerability_summary['SSRF'] = len(ssrf_issues)
-            save_html_report(ssrf_issues, 'SSRF', args.url, output_dir)
-            if db is not None:
-                db.store_issues('SSRF', ssrf_issues, base_url=args.url)
-            styled_print(f'API7 complete - {len(ssrf_issues)} issues', 'done')
-        else:
-            styled_print('No SSRF endpoints found', 'warn')
+        # SSRF scan is extremely slow (~600K requests) and yields almost nothing
+        # without authentication tokens.  Auto-skip to save ~40 minutes.
+        has_auth = bool(
+            (getattr(args, 'token', None) or '').lower() not in ('', 'none')
+            or getattr(args, 'apikey', None)
+            or getattr(args, 'auth', None) not in (None, 'none')
+        )
+        if not has_auth:
+            styled_print('API7 SSRF skipped – no authentication configured (use --token for SSRF scans)', 'warn')
             vulnerability_summary['SSRF'] = 0
+        else:
+            _scan_section(7, 'Server Side Request Forgery')
+            logger.info('Running API7 - SSRF')
+            ss_eps = SSRFAuditor.endpoints_from_swagger(args.swagger, default_base=args.url)
+            if ss_eps:
+                ss = SSRFAuditor(session=sess, base_url=args.url, swagger_spec=spec)
+                ssrf_issues = ss.test_endpoints(ss_eps)
+                vulnerability_summary['SSRF'] = len(ssrf_issues)
+                save_html_report(ssrf_issues, 'SSRF', args.url, output_dir)
+                if db is not None:
+                    db.store_issues('SSRF', ssrf_issues, base_url=args.url)
+                styled_print(f'API7 complete - {len(ssrf_issues)} issues', 'done')
+            else:
+                styled_print('No SSRF endpoints found', 'warn')
+                vulnerability_summary['SSRF'] = 0
     
     if 8 in selected_apis:
         _scan_section(8, 'Security Misconfiguration')
@@ -1536,7 +2233,12 @@ def main() -> None:
                     styled_print(f"LLM connection failed: {probe_result.get('error', 'Unknown error')}", 'fail')
                     logger.error(f'LLM connection failed: {probe_result}')
                 else:
-                    styled_print(f"Connected to LLM provider: {probe_result.get('provider', 'Unknown')}", 'ok')
+                    provider_name = (
+                        probe_result.get('provider')
+                        or probe_result.get('info', {}).get('provider')
+                        or 'Unknown'
+                    )
+                    styled_print(f"Connected to LLM provider: {provider_name}", 'ok')
                     styled_print('Starting AI security analysis...', 'info')
                     ai_results = analyze_endpoints_with_llm(
                         ai_endpoints,

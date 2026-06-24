@@ -2,7 +2,7 @@
 # APISCAN - API Security Scanner                       #
 # Licensed under the AGPL-v3.0                         #
 # Author: Perry Mertens pamsniffer@gmail.com (C) 2026  #
-# version 4.0 26-04-2026                               #
+# version 5.0 26-04-2026                               #
 ########################################################
 
 from __future__ import annotations
@@ -84,7 +84,7 @@ os.environ.setdefault('APISCAN_ADAPTIVE', '1')
 os.environ.setdefault('APISCAN_NO_TQDM', '0')
 os.environ.setdefault('APISCAN_PHASE1_SAMPLE', '20')
 os.environ.setdefault('APISCAN_API10_QUICK', '1')
-os.environ.setdefault('APISCAN_API10_QUICK_MAX_ENDPOINTS', '20')
+os.environ.setdefault('APISCAN_API10_QUICK_MAX_ENDPOINTS', '30')
 os.environ.setdefault('APISCAN_API10_QUICK_SQL_MAX_TESTS', '10')
 os.environ.setdefault('APISCAN_API10_QUICK_DIRTRAV_MAX_TESTS', '8')
 os.environ.setdefault('APISCAN_API10_QUICK_HPP_MAX_PARAMS', '3')
@@ -233,12 +233,17 @@ def build_traversal_variants_insert_between(url: str, insert_before_index: int=-
 
 
 def listen_for_quit():
+    if not sys.stdin.isatty():
+        return
     print(f"\n  {Colors.CYAN}\u25c6{Colors.RESET}  {Colors.YELLOW}Press {Colors.WHITE}Q{Colors.RESET}{Colors.YELLOW} + Enter at any time to stop scanning gracefully{Colors.RESET}\n")
-    while True:
-        inp = sys.stdin.readline().strip().lower()
-        if inp == 'q':
-            stop_requested.set()
-            print(f'\n  {Colors.RED}\u2716{Colors.RESET}  {Colors.RED}Stop requested{Colors.RESET} \u2014 finishing active tasks ...\n')
+    while not stop_requested.is_set():
+        try:
+            inp = sys.stdin.readline().strip().lower()
+            if inp == 'q':
+                stop_requested.set()
+                print(f'\n  {Colors.RED}\u2716{Colors.RESET}  {Colors.RED}Stop requested{Colors.RESET} \u2014 finishing active tasks ...\n')
+                break
+        except (EOFError, OSError):
             break
 
 os.environ['APISCAN_ENABLE_CONSOLE_STOP'] = '1'
@@ -291,7 +296,7 @@ class ProgressBar:
         if self.total > 0:
             percent = (self.current / self.total) * 100
             filled = int(self.width * self.current // self.total)
-            bar = '' * filled + '' * (self.width - filled)
+            bar = '█' * filled + '░' * (self.width - filled)
 
             if self.current > 0:
                 eta = (elapsed / self.current) * (self.total - self.current)
@@ -299,7 +304,10 @@ class ProgressBar:
             else:
                 eta_str = "ETA: ?"
 
-            sys.stdout.write(f'\r{self.desc}: |{bar}| {percent:.1f}% ({self.current}/{self.total}) '
+            # Use \\n when stdout is not a TTY (GUI/pipe) so readline()
+            # can consume the line immediately.  \\r is only safe on real terminals.
+            end_char = '\r' if sys.stdout.isatty() else '\n'
+            sys.stdout.write(f'{end_char}{self.desc}: |{bar}| {percent:.1f}% ({self.current}/{self.total}) '
                            f'[{elapsed:.1f}s, {eta_str}]')
             sys.stdout.flush()
 
@@ -497,6 +505,16 @@ class SafeConsumptionAuditor:
         self.max_workers = configured_max_workers if allow_low_workers else max(default_max_workers, configured_max_workers)
         self.base_url: str = base_url.rstrip('/')
         self.session: requests.Session = session or self._create_secure_session()
+        # Ensure 5xx responses are returned as-is instead of being retried
+        # into oblivion by a parent session's status_forcelist (causes all
+        # findings to be lost as telemetry-only when endpoints don't exist).
+        try:
+            _retry = Retry(total=0, status_forcelist=[], raise_on_status=False)
+            _adapter = HTTPAdapter(max_retries=_retry, pool_connections=400, pool_maxsize=400, pool_block=False)
+            self.session.mount('http://', _adapter)
+            self.session.mount('https://', _adapter)
+        except Exception:
+            pass
         self.log_monitor = log_monitor
         self.server_log_provider: Optional[Callable[[], List[str]]] = None
         self.fast_mode = os.getenv('APISCAN_FAST', '0').strip().lower() in ('1', 'true', 'yes', 'on')
@@ -511,8 +529,25 @@ class SafeConsumptionAuditor:
         self.quick_hpp_max_params = max(1, int(os.getenv('APISCAN_API10_QUICK_HPP_MAX_PARAMS', '3')))
         self.quick_redirect_max_tests = max(1, int(os.getenv('APISCAN_API10_QUICK_REDIRECT_MAX_TESTS', '6')))
         self.intensity = os.getenv('APISCAN_INTENSITY', 'medium').lower()
-        self.no_tqdm = os.getenv('APISCAN_NO_TQDM', '0').strip().lower() in ('1', 'true', 'yes', 'on')
+        # Honor TQDM_DISABLE (set by GUI subprocess) — tqdm carriage returns
+        # block line-buffered pipe readers; use ProgressBar fallback instead.
+        self.no_tqdm = (
+            os.getenv('APISCAN_NO_TQDM', '0').strip().lower() in ('1', 'true', 'yes', 'on')
+            or os.getenv('TQDM_DISABLE', '0').strip().lower() in ('1', 'true', 'yes', 'on')
+        )
         self.triage_payloads_per_type = 2 if self.fast_mode else 6 if self.intensity == 'low' else 12 if self.intensity == 'medium' else 24
+        # Deep scan auto-override: full payloads, high intensity, no quick mode
+        if self.deep_scan:
+            if self.intensity == 'medium':
+                self.intensity = 'high'
+            if self.quick_mode:
+                self.quick_mode = False
+            if self.fast_mode:
+                self.fast_mode = False
+            # Switch to full payload file unless user explicitly set a custom path
+            _user_payload = os.getenv('APISCAN_PAYLOADS_PATH', '').strip()
+            if not _user_payload or 'fast' in _user_payload.lower():
+                os.environ['APISCAN_PAYLOADS_PATH'] = 'data/injection_payloads.json'
         self.phase1_sample = max(1, int(os.getenv('APISCAN_PHASE1_SAMPLE', '20')))
         configured_per_host = int(os.getenv('APISCAN_PER_HOST', '6'))
         self.per_host_max_concurrency = configured_per_host if allow_low_workers else max(default_max_workers, configured_per_host)
@@ -564,7 +599,9 @@ class SafeConsumptionAuditor:
             sys.exit(1)
 
         _mode_tag = ""
-        if self.quick_mode and self.fast_mode:
+        if self.deep_scan:
+            _mode_tag = "  \033[95m[deep mode]\033[0m"
+        elif self.quick_mode and self.fast_mode:
             _mode_tag = "  \033[93m[quick + fast mode]\033[0m"
         elif self.quick_mode:
             _mode_tag = "  \033[93m[quick mode]\033[0m"
@@ -640,7 +677,7 @@ class SafeConsumptionAuditor:
     def _print_banner(self):
         _C = '\033[96m'; _R = '\033[0m'; _D = '\033[2m'
         print(f"\n  {_C}\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500{_R}")
-        print(f"  {_C}\u25b6{_R}  \033[1m\033[97mAPI10{_R}  {_C}Unsafe Consumption of APIs{_R}  {_D}v4.0{_R}")
+        print(f"  {_C}\u25b6{_R}  \033[1m\033[97mAPI10{_R}  {_C}Unsafe Consumption of APIs{_R}  {_D}v5.0{_R}")
         print(f"  {_C}\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500{_R}")
 
     #================ _create_secure_session description ##########
@@ -651,7 +688,7 @@ class SafeConsumptionAuditor:
         verify_tls = os.getenv('APISCAN_TLS_VERIFY', '1').strip().lower() in ('1', 'true', 'yes', 'on')
 
         headers = {
-            'User-Agent': 'safe_consumption_enhanced/4.0',
+            'User-Agent': 'safe_consumption_enhanced/5.0',
             'Accept': 'application/json, */*;q=0.1',
             'Accept-Encoding': 'gzip, deflate',
             'Connection': 'keep-alive',
@@ -693,23 +730,19 @@ class SafeConsumptionAuditor:
         return s
     #================ _throttle description ##########
     def _throttle(self, domain: str) -> None:
-        """Acquire the per-host semaphore, apply rate limiting delay, then release.
-
-        NOTE: The semaphore is held only during the delay computation so that
-        `last_request_ts` is updated atomically.  Callers are responsible for
-        not exceeding `per_host_max_concurrency`; that limit is already enforced
-        by the ThreadPoolExecutor worker count passed to each test method.
-        """
         sem = self.host_semaphores[domain]
-        sem.acquire()
+        acquired = sem.acquire(timeout=30)
+        if not acquired:
+            return
         try:
             now = time.perf_counter()
             delta = now - self.last_request_ts[domain]
-            if delta < self.rate_limit:
-                time.sleep(self.rate_limit - delta)
-            self.last_request_ts[domain] = time.perf_counter()
+            wait = max(0.0, self.rate_limit - delta)
+            self.last_request_ts[domain] = max(self.last_request_ts[domain], now + wait)
         finally:
             sem.release()
+        if wait > 0:
+            time.sleep(wait)
 
     #================ _safe_body description ##########
     @staticmethod
@@ -1844,9 +1877,13 @@ class SafeConsumptionAuditor:
         if self.quick_mode and not self.deep_scan:
             base_tests = [
                 partial(self._test_basic_security),
+                partial(self._test_waf_detection),
+                partial(self._test_crlf_injection),
                 partial(self._test_hpp),
                 partial(self._test_sensitive_data_exposure),
                 partial(self._test_open_redirect),
+                partial(self._test_host_header_injection),
+                partial(self._test_header_manipulation),
                 partial(self._test_directory_traversal),
             ]
         else:
@@ -1873,7 +1910,7 @@ class SafeConsumptionAuditor:
         # Injection payloads (XSS, SQLi, NoSQLi, LFI, RCE, SSTI, …)
         injection_types = list(self.INJECTION_PAYLOADS)
         if self.quick_mode and not self.deep_scan:
-            quick_types = {'sql', 'path'}
+            quick_types = {'sql', 'path', 'xss', 'nosql', 'lfi', 'ssti'}
             injection_types = [t for t in injection_types if t in quick_types]
         for _t in injection_types:
             base_tests.append(partial(self._run_injection_tests_parallel, test_type=_t))
@@ -1909,6 +1946,12 @@ class SafeConsumptionAuditor:
             skipped_auth = before_auth_skip - len(target_endpoints)
             if skipped_auth:
                 print(f'{Colors.YELLOW}  [Quick] Skipped heavy tests for {skipped_auth} protected endpoints without credentials{Colors.RESET}')
+        elif self.deep_scan:
+            deep_max = int(os.getenv('APISCAN_DEEP_MAX_ENDPOINTS', '15'))
+            before_cap = len(target_endpoints)
+            target_endpoints = target_endpoints[:deep_max]
+            if before_cap > len(target_endpoints):
+                print(f'{Colors.MAGENTA}  [Deep] Limiting Phase 2 to {len(target_endpoints)}/{before_cap} endpoints ({len(intensive_tests)} tests each). Set APISCAN_DEEP_MAX_ENDPOINTS for more.{Colors.RESET}')
 
         print(f'{Colors.WHITE}  [Testing] {len(target_endpoints)} endpoints with {len(intensive_tests)} test types{Colors.RESET}')
 
@@ -2313,7 +2356,9 @@ class SafeConsumptionAuditor:
             status = r.status_code
 
             if status in {401, 403}:
-                self._log('Auth required / forbidden', endpoint, 'Info', response=r)
+                # If no authentication is configured, 401/403 is expected — suppress.
+                if self._has_auth_configured():
+                    self._log('Auth required / forbidden', endpoint, 'Info', response=r)
             elif status == 404:
                 self._log('Not found', endpoint, 'Info', response=r)
             elif status == 405:
@@ -2866,7 +2911,7 @@ class SafeConsumptionAuditor:
 
 
     #================ _dirtrav_success_indicators description ##########
-    def _dirtrav_success_indicators(body: str) -> bool:
+    def _dirtrav_success_indicators(self, body: str) -> bool:
         if not body:
             return False
         signatures = [
@@ -3171,11 +3216,18 @@ class SafeConsumptionAuditor:
                         if stop_requested.is_set():
                             break
                         futures.append(executor.submit(do_req, u, label))
-                    for f in concurrent.futures.as_completed(futures):
+                    # Per-endpoint dirtrav timeout: 120 seconds prevents a single
+                    # slow/stuck endpoint from hanging the entire Phase 2 scan.
+                    dirtrav_deadline = 120
+                    for f in concurrent.futures.as_completed(futures, timeout=dirtrav_deadline):
                         try:
                             f.result()
                         except Exception:
                             pass
+            except concurrent.futures.TimeoutError:
+                if dirtrav_pbar is not None:
+                    dirtrav_pbar.close()
+                dirtrav_pbar = None
             finally:
                 if dirtrav_pbar is not None:
                     dirtrav_pbar.close()
@@ -4081,21 +4133,13 @@ class SafeConsumptionAuditor:
     #================ _should_skip_heavy_endpoint description ##########
     def _should_skip_heavy_endpoint(self, endpoint: str) -> bool:
         try:
-            headers = getattr(self.session, 'headers', {}) or {}
-            has_auth = bool(headers.get('Authorization') or headers.get('X-API-Key') or headers.get('Cookie'))
-            if has_auth:
+            if self._has_auth_configured():
                 return False
             domain = urlparse.urlparse(endpoint).netloc or ""
             self._throttle(domain)
             resp = self.session.get(endpoint, timeout=(2, 4), allow_redirects=False)
             if resp.status_code in (401, 403):
-                self._log(
-                    'Auth required / forbidden',
-                    endpoint,
-                    'Info',
-                    response=resp,
-                    extra={'vector': 'access-control', 'confidence': 'high', 'control_observed': True},
-                )
+                # No auth configured — 401/403 is expected, suppress finding.
                 return True
         except Exception as e:
             self._record_telemetry(
@@ -4104,6 +4148,19 @@ class SafeConsumptionAuditor:
                 extra={'error': str(e), 'vector': 'precheck'},
             )
         return False
+
+    #================ _has_auth_configured check if any auth is set up ##########
+    def _has_auth_configured(self) -> bool:
+        try:
+            headers = getattr(self.session, 'headers', {}) or {}
+            return bool(
+                headers.get('Authorization')
+                or headers.get('X-API-Key')
+                or headers.get('Api-Key')
+                or headers.get('Cookie')
+            )
+        except Exception:
+            return False
 
 
     #================ _filter_issues description ##########
@@ -4331,12 +4388,18 @@ class SafeConsumptionAuditor:
                     )
                     continue
 
+            # Make payload hashable for dedup (dict payloads from business logic etc.)
+            _payload = issue.get('payload', '')
+            if isinstance(_payload, dict):
+                _payload = json.dumps(_payload, sort_keys=True, default=str)
+            elif not isinstance(_payload, (str, int, float, bool, type(None))):
+                _payload = str(_payload)
             dedup_key = (
                 issue.get('method'),
                 issue.get('path') or issue.get('endpoint'),
                 issue.get('status_code'),
                 issue.get('issue'),
-                issue.get('payload'),
+                _payload,
             )
             if dedup_key in seen:
                 continue
@@ -4358,6 +4421,11 @@ class SafeConsumptionAuditor:
             path = f.get('path') or f.get('endpoint') or f.get('url') or ''
             status = f.get('status_code')
             payload = f.get('payload') or ''
+            # Ensure payload is hashable (e.g., business_logic uses dict payloads)
+            if isinstance(payload, dict):
+                payload = json.dumps(payload, sort_keys=True, default=str)
+            elif not isinstance(payload, (str, int, float, bool, type(None))):
+                payload = str(payload)
             vector = (f.get('vector') or '').lower()
 
             if (
@@ -4524,7 +4592,16 @@ class SafeConsumptionAuditor:
         import json
 
         raw = Path(swagger_path).read_text(encoding="utf-8")
-        spec = json.loads(raw)
+        path_lower = str(swagger_path).lower()
+        if path_lower.endswith(('.yml', '.yaml')):
+            import yaml as _yaml
+            spec = _yaml.safe_load(raw) or {}
+        else:
+            try:
+                spec = json.loads(raw)
+            except json.JSONDecodeError:
+                import yaml as _yaml
+                spec = _yaml.safe_load(raw) or {}
 
         servers = []
         for srv in (spec.get("servers") or []):
@@ -4561,7 +4638,17 @@ class SafeConsumptionAuditor:
     def third_party_hosts_from_swagger(swagger_path: str) -> List[str]:
         from pathlib import Path
         import json
-        spec = json.loads(Path(swagger_path).read_text(encoding='utf-8'))
+        raw = Path(swagger_path).read_text(encoding='utf-8')
+        path_lower = str(swagger_path).lower()
+        if path_lower.endswith(('.yml', '.yaml')):
+            import yaml as _yaml
+            spec = _yaml.safe_load(raw) or {}
+        else:
+            try:
+                spec = json.loads(raw)
+            except json.JSONDecodeError:
+                import yaml as _yaml
+                spec = _yaml.safe_load(raw) or {}
         hosts: Set[str] = set()
         for srv in spec.get('servers', []):
             url = srv.get('url')

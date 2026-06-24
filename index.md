@@ -1,6 +1,6 @@
 ---
-title: APISCAN v4.0 – AI enhanced OWASP APIScanner by Perry Mertens (AGPL-v3.0)
-description: Free and open-source APIscanner built in Python with multi-auth, OpenAPI/Swagger support, sanitizer/rewrites, and rich CSV/HTML reporting.
+title: APISCAN v5.0.0 – Production-Ready OWASP API Security Scanner by Perry Mertens (AGPL-v3.0)
+description: Free and open-source OWASP API Security Top 10 scanner with auto form-login, crawl validation, deep scanning, GUI, and rich HTML reporting.
 ---
 
 <meta content="VvYq2k5BFp5dpIL6JpQhoe90sWEXZTEBbaynlEKCWRE" name="google-site-verification">
@@ -12,9 +12,9 @@ APIscan is an API vulnerability scanner that proactively identifies security ris
 It uses your OpenAPI/Swagger specification to generate realistic attack payloads and detect issues such as Broken Object Level Authorization (BOLA), Broken Authentication, Excessive Data Exposure, and other critical API vulnerabilities.
 It understands **OpenAPI/Swagger**, supports **multiple authentication flows**, provides a **plan/verify workflow**, includes a **generic sanitizer/rewrites**, and writes **CSV/HTML** artifacts.
 
-This page is the generic, customer-agnostic documentation corresponding to the v3.0 GitHub Pages landing (`index.html`).
+This page is the documentation corresponding to the v5.0.0 GitHub Pages landing (`index.html`).
 
-![APISCAN v4.0 dashboard](./apiscan_v3_dashboard.jpg)
+![APISCAN v5.0.0](./APISCAN-mainmenu%20v5.0.0.jpg)
 
 ---
 
@@ -28,37 +28,30 @@ Use APISCAN only on systems and APIs for which you have explicit authorization.
 
 ---
 
-## What's new in v4.0
+## What's new in v5.0.0
 
-v4.0 focuses on better planning, headers, and robustness for enterprise scans:
+v5.0.0 is the first production-ready release — tested on Juice Shop and crAPI.
 
-- **Generic sanitizer (no hardcodes)**  
-  Collapses duplicate path segments, normalizes `/vN` → `/vN.00`, trims trailing slashes.  
-  Control with:
-  - `--no-sanitize` to disable sanitizer  
-  - `--rewrite "pat=>rep"` for targeted rewrites  
+- **Auto Form-Login**
+  Automatic login detection for crAPI, Juice Shop, and custom apps. Auto-detects login endpoints via Swagger spec scanning, common path probing, and HTML form crawling. Token auto-extraction from JSON body, Authorization header, and Set-Cookie. GUI tab with one-click Auto-Detect.
 
-- **Universal header overrides**  
-  One unified model for headers:  
-  - `--flow token --token "<JWT>"`  
-  - `--apikey --apikey-header`  
-  - `--extra-header "X-Header: value"` (repeatable)  
-  - `--headers-file headers.json` for JSON-based headers  
-  OpenAPI `example`/`default` values are auto-applied where possible.
+- **Crawl Endpoint Validator**
+  Smart validation filters fake paths: Juice Shop "Unexpected path" 500 errors, SPA homepage fallbacks, 404 HTML pages. Keeps only real API endpoints — 71→4 on Juice Shop.
 
-- **IDs & samples for path variables**  
-  - `--ids-file ids.json` to control `{param}` values  
-  - Fallback generator for names like `*id`, `code`, `uuid`, `email`, `date`.
+- **Deep Scan Mode**
+  `APISCAN_DEEP_SCAN=1` auto-switches to full payloads (`injection_payloads.json`), high intensity, no quick mode. All injection types including SSTI, LDAP, XXE, RCE.
 
-- **Improved planning & verification**  
-  - Better `requestBody` sampling order  
-  - Accurate JSON detection (`application/json; charset=UTF-8`)  
-  - `--verify-plan` to actually send planned requests  
-  - `--success-codes "200-299,304"` to define acceptable responses.
+- **Expanded Quick Scan (Default)**
+  Now 9 base tests + 6 injection types (SQL, Path, XSS, NoSQL, LFI, SSTI). Endpoint cap raised 20→30.
 
-- **Adaptive retry**  
-  - `--retry500 N` for automatic retries on HTTP 5xx errors  
-  - `--no-retry-500` to disable this behaviour.
+- **Graphical User Interface**
+  `python apiscan_gui.py` — cross-platform Tkinter GUI with Target, Authentication, Form Login, OWASP Scans, and Advanced tabs. Start/Stop scan from header bar.
+
+- **Business Logic Testing**
+  Detects negative prices, excessive discounts, admin role assignment, and privilege escalation via deep scan mode.
+
+- **Stability & Crash Fixes**
+  Session retry fix for 500 responses, dedup fix for dict payloads, HTML response skip in form detection, error spam suppression, circular import resolution.
 
 ---
 
@@ -162,6 +155,23 @@ python apiscan.py --url https://api.example.com \
   --plan-only --verify-plan
 ```
 
+### Form Auto-Login (Juice Shop / crAPI)
+
+```bash
+# crAPI
+python apiscan.py --url http://127.0.0.1:8888 \
+  --swagger openapi.json \
+  --flow form \
+  --login-username user@email.com \
+  --login-password "Password123"
+
+# Juice Shop
+python apiscan.py --url http://192.168.168.132:3000 \
+  --crawl --flow form \
+  --login-username aa@aa.de \
+  --login-password "Banaan@+565"
+```
+
 ### With version normalization + retries
 
 ```bash
@@ -175,17 +185,16 @@ python apiscan.py --url https://api.example.com \
 
 ### API10 quick mode and full scan
 
-API10 (Unsafe Consumption of APIs) runs in quick mode by default. Quick mode keeps regular scans fast by limiting Phase 2 to the most promising endpoints and by capping quick SQL testing.
+API10 runs 9 base tests + 6 injection types by default on up to 30 endpoints.
 
 Defaults:
 
 - `APISCAN_API10_QUICK=1`
-- `APISCAN_API10_QUICK_MAX_ENDPOINTS=20`
+- `APISCAN_API10_QUICK_MAX_ENDPOINTS=30`
 - `APISCAN_API10_QUICK_SQL_MAX_TESTS=10`
 - `APISCAN_API10_QUICK_DIRTRAV_MAX_TESTS=8`
 - `APISCAN_API10_QUICK_HPP_MAX_PARAMS=3`
 - `APISCAN_API10_QUICK_REDIRECT_MAX_TESTS=6`
-- `APISCAN_RATE_LIMIT=0`
 
 PowerShell:
 
@@ -194,7 +203,7 @@ PowerShell:
 $env:APISCAN_API10_QUICK="1"
 
 # Optional quick tuning
-$env:APISCAN_API10_QUICK_MAX_ENDPOINTS="20"
+$env:APISCAN_API10_QUICK_MAX_ENDPOINTS="30"
 $env:APISCAN_API10_QUICK_SQL_MAX_TESTS="10"
 
 # Full API10 scan

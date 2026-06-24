@@ -1009,7 +1009,7 @@
           const el = document.createElement("div");
           el.className = "tree-item";
           el.dataset.key = "cat:" + cat;
-          el.innerHTML = "<span class=\"label\">" + cat + "</span><span class=\"count\">" + count + "</span>";
+          el.innerHTML = "<span class=\"label\">" + escapeHtml(cat) + "</span><span class=\"count\">" + count + "</span>";
           el.addEventListener("click", function () {
             setActiveTree(el);
             currentTreeFilter = { type: "category", value: cat };
@@ -1246,7 +1246,10 @@
       return String(str)
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;");
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;")
+        .replace(/\//g, "&#x2F;");
     }
 
     function formatSignals(it) {

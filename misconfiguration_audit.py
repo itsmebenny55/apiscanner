@@ -1,9 +1,10 @@
 ########################################################
 # APISCAN - API Security Scanner                       #
 # Licensed under the AGPL-v3.0                         #
-# Author: Perry Mertens pamsniffer@gmail.com (C) 2025  #
-# version 4.0 26-04-2026                              #
-########################################################                                             
+# Author: Perry Mertens pamsniffer@gmail.com (C) 2026  #
+# version 5.0 24-06-2026                               #
+########################################################
+                                             
 from __future__ import annotations
 import json
 import logging
@@ -97,9 +98,11 @@ class MisconfigurationAuditorPro:
         self._tested_payloads = set()
         self._finding_count: Dict[Tuple[str, str], int] = {}
         self._reported_header_hosts  = set()
+        self._printed_categories: set = set()  # suppress duplicate CORS/header output
         self._response_analyzers = [
             self._security_header_analyzer,
             self._cors_analyzer,
+            self._crash_signature_analyzer,
             self._server_error_analyzer,
             self._verbose_error_analyzer,
             self._http_method_analyzer,
@@ -113,23 +116,57 @@ class MisconfigurationAuditorPro:
         self._endpoint_error_counts = {}
         self._param_error_logged = set()
         self._timeout_logged: set = set()
+        self._crash_signature_counts: Dict[Tuple[str, str, str], int] = {}
+        self._repeatable_probe_done: set[Tuple[str, str, str]] = set()
 
     #================funtion _exception_response build response-like evidence for request exceptions ##########
-    def _exception_response(self, method: str, url: str, exc: Exception):
+    def _exception_response(self, method: str, url: str, exc: Exception, req_headers: Optional[Dict[str, str]] = None, req_body: Any = None):
         text = str(exc)
+        status_code = 500
+        resp_headers = {}
+        resp_text = text
+        resp_content = text.encode("utf-8", errors="replace")
+
+        exc_resp = getattr(exc, "response", None)
+        if exc_resp is not None:
+            try:
+                status_code = int(getattr(exc_resp, "status_code", 500) or 500)
+            except Exception:
+                status_code = 500
+            try:
+                resp_headers = dict(getattr(exc_resp, "headers", {}) or {})
+            except Exception:
+                resp_headers = {}
+            try:
+                resp_text = getattr(exc_resp, "text", None) or text
+            except Exception:
+                resp_text = text
+            try:
+                resp_content = bytes(getattr(exc_resp, "content", b"") or b"")
+                if not resp_content:
+                    resp_content = str(resp_text).encode("utf-8", errors="replace")
+            except Exception:
+                resp_content = str(resp_text).encode("utf-8", errors="replace")
 
         class _Cookies:
             def get_dict(self):
                 return {}
 
+        request_obj = SimpleNamespace(method=method, url=url, headers=req_headers or {}, body=req_body)
+        try:
+            if exc_resp is not None and getattr(exc_resp, "request", None) is not None:
+                request_obj = exc_resp.request
+        except Exception:
+            pass
+
         return SimpleNamespace(
-            status_code=500,
-            headers={},
-            text=text,
-            content=text.encode("utf-8", errors="replace"),
+            status_code=status_code,
+            headers=resp_headers,
+            text=resp_text,
+            content=resp_content,
             cookies=_Cookies(),
-            raw=SimpleNamespace(headers={}),
-            request=SimpleNamespace(method=method, url=url, headers={}),
+            raw=SimpleNamespace(headers=resp_headers),
+            request=request_obj,
         )
 
     #================funtion _tw logging wrapper ##########
@@ -142,6 +179,10 @@ class MisconfigurationAuditorPro:
             ic  = _icons.get(level, _icons['info'])
             lb  = _labels.get(level, _labels['info'])
             msg = message
+            # Suppress connection-pool noise from endpoints that don't exist
+            msg_low = message.lower()
+            if any(k in msg_low for k in ('httpconnectionpool', 'max retries exceeded', 'failed to establish a new connection')):
+                return  # silent — endpoint doesn't exist, not a real error
             # Condense noisy timeout messages: extract method+/path, show 'Timeout'
             if 'timed out' in message.lower() or 'timeout' in message.lower():
                 _ep = re.search(r'((?:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+/\S*)', message)
@@ -250,7 +291,19 @@ class MisconfigurationAuditorPro:
     #================funtion endpoints_from_swagger parse Swagger/OpenAPI file to endpoints ##########
     def endpoints_from_swagger(cls, swagger_path: str) -> List[Endpoint]:
         try:
-            spec = json.loads(Path(swagger_path).read_text(encoding="utf-8"))
+            raw = Path(swagger_path).read_text(encoding="utf-8")
+            # Support both JSON and YAML OpenAPI specs (VAmPI uses .yml, crAPI uses .json).
+            path_lower = str(swagger_path).lower()
+            if path_lower.endswith(('.yml', '.yaml')):
+                import yaml as _yaml
+                spec = _yaml.safe_load(raw) or {}
+            else:
+                try:
+                    spec = json.loads(raw)
+                except json.JSONDecodeError:
+                    # Fallback: try YAML even without .yml extension.
+                    import yaml as _yaml
+                    spec = _yaml.safe_load(raw) or {}
             server = str((spec.get("servers", [{}]) or [{}])[0].get("url", "") or "")
             eps: List[Endpoint] = []
             for path, item in (spec.get("paths") or {}).items():
@@ -361,6 +414,8 @@ class MisconfigurationAuditorPro:
         return {
             "name": f"{endpoint['method']} {endpoint['path']}",
             "endpoint": f"{endpoint['method']} {endpoint['path']}",
+            "url": str(getattr(getattr(response, "request", None), "url", "") or f"{endpoint['method']} {endpoint['path']}"),
+            "request_method": str(getattr(getattr(response, "request", None), "method", endpoint.get("method", "GET"))).upper(),
             "operation_id": endpoint.get("operationId", ""),
             "payload": payload,
             "status_code": response.status_code,
@@ -380,9 +435,11 @@ class MisconfigurationAuditorPro:
 
     #================funtion _enforce_rate_limit throttle outbound requests ##########
     def _enforce_rate_limit(self) -> None:
-        now = time.time()
         gap = 1.0 / float(self.requests_per_second)
+        # Compute wait time under lock, then sleep OUTSIDE the lock so other
+        # threads are not blocked while this one is idling.
         with self._lock:
+            now = time.time()
             elapsed = now - self._last_request_time
             wait = max(0.0, gap - elapsed)
         if wait > 0:
@@ -473,12 +530,19 @@ class MisconfigurationAuditorPro:
                             self._endpoint_error_counts.get(error_key, 0) + 1
                     if self._suppress_excessive_errors(method, path):
                         error_msg = str(e)
-                        if "500" in error_msg or "Internal Server Error" in error_msg:
+                        # Connection errors (Max retries / ConnectionPool) are not
+                        # real 500 responses — skip them to avoid false positives.
+                        is_conn_error = any(x in error_msg.lower() for x in (
+                            'connectionpool', 'max retries', 'connection refused',
+                            'name or service not known', 'no route to host',
+                            'connection aborted', 'connection reset',
+                        ))
+                        if ("500" in error_msg or "Internal Server Error" in error_msg) and not is_conn_error:
                             try:
                                 finding = self._build_finding(
                                     ep,
                                     f"<{m}>",
-                                    self._exception_response(m, full_url, e),
+                                    self._exception_response(m, full_url, e, req_headers=headers, req_body=None),
                                     0.0,
                                     "500 error on baseline/probe",
                                     "Medium",
@@ -522,6 +586,14 @@ class MisconfigurationAuditorPro:
                             self._record_finding(f)
                     except Exception as ex:
                         self._tw(f"Analyzer {analyzer.__name__} on {m} {path}: {ex}", "debug")
+                if 500 <= resp.status_code < 600:
+                    replay_key = (method, path, m)
+                    with self._lock:
+                        already_replayed = replay_key in self._repeatable_probe_done
+                        if not already_replayed:
+                            self._repeatable_probe_done.add(replay_key)
+                    if not already_replayed:
+                        self._confirm_repeatable_5xx(ep, f"<{m}>", full_url, m, headers, resp)
             if method == "GET":
                 with self._lock:
                     if self._endpoint_error_counts.get(error_key, 0) >= 3:
@@ -595,15 +667,13 @@ class MisconfigurationAuditorPro:
                                     error_msg = str(e)
                                     if "500" in error_msg or "Internal Server Error" in error_msg:
                                         try:
-                                            mock_resp = type('MockResponse', (), {
-                                                'status_code': 500,
-                                                'headers': {},
-                                                'text': str(e),
-                                                'request': type('MockRequest', (), {
-                                                    'method': method,
-                                                    'url': crafted
-                                                })()
-                                            })()
+                                            mock_resp = self._exception_response(
+                                                method,
+                                                crafted,
+                                                e,
+                                                req_headers=dict(getattr(self.session, "headers", {}) or {}),
+                                                req_body=None,
+                                            )
                                             
                                             finding = self._build_finding(
                                                 ep,
@@ -658,10 +728,17 @@ class MisconfigurationAuditorPro:
             missing.append("HSTS")
         if low_keys.get("x-content-type-options", "").lower() != "nosniff":
             missing.append("X-Content-Type-Options")
-        if "x-frame-options" not in low_keys:
+        if "x-frame-options" not in low_keys and "content-security-policy" not in low_keys:
             missing.append("X-Frame-Options")
         if "content-security-policy" not in low_keys:
             missing.append("CSP")
+        if "referrer-policy" not in low_keys:
+            missing.append("Referrer-Policy")
+        if "permissions-policy" not in low_keys and "feature-policy" not in low_keys:
+            missing.append("Permissions-Policy")
+        cache = low_keys.get("cache-control", "")
+        if not any(d in cache for d in ("no-store", "no-cache", "private")):
+            missing.append("Cache-Control (no-store/no-cache/private)")
 
         if not missing:
             return None
@@ -691,13 +768,11 @@ class MisconfigurationAuditorPro:
         method = getattr(getattr(resp, "request", None), "method", "GET").upper()
         endpoint_method = str((ep or {}).get("method") or "GET").upper()
 
-        # Avoid duplicate CORS findings from synthetic probes.
         if method == "HEAD":
             return None
         if method == "OPTIONS" and endpoint_method == "GET":
             return None
 
-        # Default severity
         sev = "Info"
         desc_parts = [f"ACAO={acao}", f"ACAC={acac or 'false'}"]
         
@@ -714,12 +789,122 @@ class MisconfigurationAuditorPro:
             sev = "Low" if method != "OPTIONS" else "Info"
             desc_parts.append("Wildcard CORS")
 
+        # ── Data exposure check: does the response body leak sensitive data? ──
+        try:
+            body_text = getattr(resp, "text", "") or ""
+            ct = (hdrs.get("Content-Type", "") or "").lower()
+            if "application/json" in ct and len(body_text) > 200:
+                import json as _json
+                try:
+                    data = _json.loads(body_text)
+                except Exception:
+                    data = None
+
+                if isinstance(data, dict):
+                    # Check for wrapped data: {"status":"success","data":[...]}
+                    inner = data.get("data") or data
+                    if isinstance(inner, list) and len(inner) >= 3:
+                        first = inner[0] if isinstance(inner[0], dict) else {}
+                        # Detect user/account objects with sensitive fields
+                        sensitive_fields = {"email", "role", "token", "password", "secret", "key",
+                                           "ssn", "credit", "ip", "lastLoginIp", "deluxeToken"}
+                        found_fields = [k for k in first if k.lower() in sensitive_fields or
+                                       any(s in k.lower() for s in ("token", "secret", "key", "password", "pass"))]
+                        if len(found_fields) >= 2:
+                            sev = "Critical"
+                            desc_parts.append(f"DATA LEAK: {len(inner)} records exposed with fields: {', '.join(found_fields[:5])}")
+                        elif len(inner) >= 10:
+                            sev = max(sev, "High") if sev in ("Info", "Low", "Medium") else sev
+                            desc_parts.append(f"Large data dump: {len(inner)} records returned without auth")
+                elif isinstance(data, list) and len(data) >= 3:
+                    first = data[0] if isinstance(data[0], dict) else {}
+                    sensitive_fields = {"email", "role", "token", "password", "secret", "key",
+                                       "ssn", "credit", "ip", "lastLoginIp", "deluxeToken"}
+                    found_fields = [k for k in first if k.lower() in sensitive_fields or
+                                   any(s in k.lower() for s in ("token", "secret", "key", "password", "pass"))]
+                    if len(found_fields) >= 2:
+                        sev = "Critical"
+                        desc_parts.append(f"DATA LEAK: {len(data)} records exposed with fields: {', '.join(found_fields[:5])}")
+                    elif len(data) >= 10:
+                        sev = max(sev, "High") if sev in ("Info", "Low", "Medium") else sev
+                        desc_parts.append(f"Large data dump: {len(data)} records returned without auth")
+        except Exception:
+            pass
+
         return self._build_finding(ep, payload, resp, dur, ", ".join(desc_parts), sev)
 
     #================funtion _server_error_analyzer flag 5xx server errors ########## flag 5xx server errors ##########
     def _server_error_analyzer(self, ep, payload, resp, dur):
         if 500 <= resp.status_code < 600:
             return self._build_finding(ep, payload, resp, dur, f"{resp.status_code} on baseline/probe", "Medium")
+
+    #================funtion _crash_signature_analyzer detect repeatable 5xx crash signatures ##########
+    def _crash_signature_analyzer(self, ep, payload, resp, dur):
+        if not (500 <= resp.status_code < 600):
+            return None
+
+        method = str((ep or {}).get("method") or "GET").upper()
+        path = str((ep or {}).get("path") or "")
+        body = (getattr(resp, "text", "") or "")
+        body_low = body.lower()
+
+        markers = (
+            "traceback",
+            "exception",
+            "multivaluedictkeyerror",
+            "keyerror:",
+            "django.utils.datastructures",
+            "internal server error",
+        )
+        marker = next((m for m in markers if m in body_low), None)
+
+        if marker:
+            sig = f"marker={marker}"
+            sev = "High"
+        else:
+            ct = (resp.headers.get("Content-Type", "") or "").lower()
+            sig = f"status={resp.status_code};ct={ct[:64]};len={len(body)}"
+            sev = "Medium"
+
+        key = (method, path, sig)
+        with self._lock:
+            n = self._crash_signature_counts.get(key, 0) + 1
+            self._crash_signature_counts[key] = n
+
+        # Only emit once when reproducibility is first established.
+        if n < 2:
+            return None
+        if n > 2:
+            return None
+
+        desc = f"Repeatable server-side crash signature on baseline/probe ({sig})"
+        return self._build_finding(ep, payload, resp, dur, desc, sev)
+
+    #================funtion _confirm_repeatable_5xx replay once to verify deterministic 5xx ##########
+    def _confirm_repeatable_5xx(self, ep, payload, url, method, headers, first_resp):
+        if not (500 <= getattr(first_resp, "status_code", 0) < 600):
+            return
+        try:
+            self._enforce_rate_limit()
+            start = time.time()
+            second = self.session.request(method, url, headers=headers, timeout=self.timeout, allow_redirects=True)
+            dur2 = time.time() - start
+        except requests.RequestException:
+            return
+
+        if not (500 <= getattr(second, "status_code", 0) < 600):
+            return
+
+        body_low = ((getattr(first_resp, "text", "") or "") + "\n" + (getattr(second, "text", "") or "")).lower()
+        markers = (
+            "traceback", "exception", "multivaluedictkeyerror", "keyerror:",
+            "django.utils.datastructures", "internal server error",
+        )
+        marker = next((m for m in markers if m in body_low), None)
+        sig = f"marker={marker}" if marker else f"status={first_resp.status_code}/{second.status_code}"
+        sev = "High" if marker else "Medium"
+        desc = f"Repeatable server-side crash signature confirmed (2x) [{sig}]"
+        self._record_finding(self._build_finding(ep, payload, second, dur2, desc, sev))
 
                                                                                            
     #================funtion _verbose_error_analyzer detect verbose error disclosures ##########
@@ -777,7 +962,14 @@ class MisconfigurationAuditorPro:
                     sev = finding['severity'].lower()
                     sc  = _SEV.get(sev, '\033[97m')
                     badge = f"{sc}{finding['severity'].upper():<8}{_R}"
-                    tqdm.write(f"  {_YEL}\u25c8{_R}  {badge}  {finding['description']}  {_CYN}@{_R}  {finding['endpoint']}")
+                    desc = finding['description']
+                    # Dedup live output for CORS/headers — only show first occurrence
+                    if any(d in desc for d in ('ACAO=*, ACAC=false', 'Missing: ', 'API schema')):
+                        cat_key = (desc[:80], finding['severity'])
+                        if cat_key in self._printed_categories:
+                            return  # already shown this category
+                        self._printed_categories.add(cat_key)
+                    tqdm.write(f"  {_YEL}\u25c8{_R}  {badge}  {desc}  {_CYN}@{_R}  {finding['endpoint']}")
 
     
     #================funtion _title_for compose display title for endpoint ##########
@@ -811,7 +1003,8 @@ class MisconfigurationAuditorPro:
 
         VERBOSE_5XX_KEEP = (
             "exception", "stack trace", "traceback", "sqlstate",
-            "nullreferenceexception", "at com.", "internal server error"
+            "nullreferenceexception", "at com.", "internal server error",
+            "multivaluedictkeyerror", "keyerror:"
         )
 
         items = getattr(self, "_findings", []) or getattr(self, "issues", [])
@@ -831,14 +1024,23 @@ class MisconfigurationAuditorPro:
                 continue
                                                                                  
             if status >= 500:
+                desc_low = str(i.get("description") or "").lower()
                 if payload in ("<head>", "<options>"):
                     continue
                 if any(m in body_low for m in NOISE_5XX_BODY_MARKERS):
                     continue
-                if not any(m in body_low for m in VERBOSE_5XX_KEEP):
+                if "repeatable server-side crash signature" in desc_low:
+                    pass
+                elif not any(m in body_low for m in VERBOSE_5XX_KEEP):
                     i["severity"] = "Info"
 
             key = (i.get("endpoint"), i.get("description"), str(status), str(i.get("description") or "")[:120],)
+            # For structural findings (CORS, headers, schema exposure) that
+            # are identical across all endpoints, deduplicate globally instead
+            # of per-endpoint to avoid 75× "Wildcard CORS" spam.
+            desc = str(i.get("description") or "")
+            if any(d in desc for d in ('ACAO=*, ACAC=false', 'Missing: ', 'API schema/specification exposed')):
+                key = (desc[:120], str(status))
             if key in seen:
                 continue
             seen.add(key)
@@ -863,6 +1065,8 @@ class MisconfigurationAuditorPro:
         # Reset error tracking voor nieuwe scan
         self._endpoint_error_counts = {}
         self._param_error_logged = set()
+        self._crash_signature_counts = {}
+        self._repeatable_probe_done = set()
 
         with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
             futures = [pool.submit(self._test_single_endpoint, ep) for ep in endpoints]
@@ -873,7 +1077,134 @@ class MisconfigurationAuditorPro:
                 for _ in as_completed(futures):
                     pass
 
+        # ── API enumeration / metadata exposure (Salesforce attack Step 2) ──
+        # Attackers use /limits/, /sobjects/, and schema endpoints to profile
+        # the API before data exfiltration.  Detecting these as misconfigurations.
+        self._test_enumeration_exposure()
+
         return self._filter_issues()
+
+
+    #================funtion _test_enumeration_exposure detect API metadata/object enumeration leakage ##########
+    def _test_enumeration_exposure(self) -> None:
+        """Detect Salesforce-style enumeration endpoints (Step 2 of attack kill chain).
+
+        Before extracting data, attackers profile the API:
+        - /limits/       → reveals per-object API rate thresholds
+        - /sobjects/     → lists all available CRM objects and their endpoints
+        - /describe/     → exposes field names, types, and relationships per object
+
+        These are API8 (Security Misconfiguration): internal metadata leaked to
+        any authenticated user, enabling mass data exfiltration planning.
+        """
+        _ENUMERATION_PATHS = [
+            ("/services/data/v62.0/limits/",        "Salesforce API limits"),
+            ("/services/data/v61.0/limits/",        "Salesforce API limits"),
+            ("/services/data/v60.0/limits/",        "Salesforce API limits"),
+            ("/services/data/v59.0/limits/",        "Salesforce API limits"),
+            ("/services/data/v58.0/limits/",        "Salesforce API limits"),
+            ("/services/data/v62.0/sobjects/",      "Salesforce object listing"),
+            ("/services/data/v61.0/sobjects/",      "Salesforce object listing"),
+            ("/services/data/v60.0/sobjects/",      "Salesforce object listing"),
+            ("/services/data/v59.0/sobjects/",      "Salesforce object listing"),
+            ("/services/data/v58.0/sobjects/",      "Salesforce object listing"),
+            ("/api/limits",                          "API rate limits"),
+            ("/api/v1/limits",                       "API rate limits"),
+            ("/limits",                              "API rate limits"),
+            ("/api/schema",                          "API schema/objects"),
+            ("/api/v1/schema",                       "API schema/objects"),
+            ("/schema",                              "API schema/objects"),
+            ("/swagger.json",                        "API specification"),
+            ("/openapi.json",                        "API specification"),
+            ("/v3/api-docs",                         "API specification"),
+            ("/graphql",                             "GraphQL endpoint"),
+            ("/api/graphql",                         "GraphQL endpoint"),
+        ]
+
+        found_any = False
+        for path, label in _ENUMERATION_PATHS:
+            url = urljoin(self.base_url + "/", path.lstrip("/"))
+            try:
+                self._enforce_rate_limit()
+                resp = self.session.get(url, timeout=self.timeout, allow_redirects=True)
+                if resp.status_code == 404:
+                    continue
+                if resp.status_code in (401, 403):
+                    continue
+
+                body = (resp.text or "")[:4096]
+                ctype = (resp.headers.get("Content-Type", "") or "").lower()
+
+                # /limits/ — returns JSON with per-object rate thresholds
+                if "limits" in path.lower() and resp.status_code == 200:
+                    if "application/json" in ctype:
+                        try:
+                            data = resp.json()
+                            if isinstance(data, dict) and len(data) > 2:
+                                keys = list(data.keys())[:5]
+                                self._record_finding(
+                                    self._build_finding(
+                                        {"method": "GET", "path": path}, path, resp, 0,
+                                        f"API enumeration metadata exposed: {label} ({len(data)} entries, e.g. {', '.join(str(k) for k in keys)})",
+                                        "Medium",
+                                    )
+                                )
+                                found_any = True
+                        except Exception:
+                            pass
+
+                # /sobjects/ — returns JSON list of all CRM objects
+                elif "sobjects" in path.lower() and resp.status_code == 200:
+                    if "application/json" in ctype:
+                        try:
+                            data = resp.json()
+                            count = len(data) if isinstance(data, list) else len(data.get("sobjects", []))
+                            if count > 5:
+                                self._record_finding(
+                                    self._build_finding(
+                                        {"method": "GET", "path": path}, path, resp, 0,
+                                        f"API object enumeration exposed: {label} ({count} objects - enables data exfiltration scoping)",
+                                        "High" if count > 20 else "Medium",
+                                    )
+                                )
+                                found_any = True
+                        except Exception:
+                            pass
+
+                # Schema / spec files
+                elif any(k in path.lower() for k in ("schema", "swagger", "openapi", "api-docs")) and resp.status_code == 200:
+                    if "json" in ctype or "yaml" in ctype or path.endswith((".json", ".yaml", ".yml")):
+                        size = len(resp.content or b"")
+                        if size > 500:
+                            self._record_finding(
+                                self._build_finding(
+                                    {"method": "GET", "path": path}, path, resp, 0,
+                                    f"API schema/specification exposed: {label} ({size} bytes)",
+                                    "Low",
+                                )
+                            )
+                            found_any = True
+
+                # GraphQL introspection
+                elif "graphql" in path.lower() and resp.status_code == 200:
+                    if "__schema" in body or "query" in body.lower():
+                        self._record_finding(
+                            self._build_finding(
+                                {"method": "GET", "path": path}, path, resp, 0,
+                                f"GraphQL endpoint accessible: {label} (introspection may be enabled)",
+                                "Medium",
+                            )
+                        )
+                        found_any = True
+
+            except Exception:
+                continue
+
+        if found_any:
+            self._tw(
+                "API enumeration endpoints found - attacker can profile objects and limits before data exfiltration (Salesforce kill chain Step 2)",
+                "warn",
+            )
 
                                                                                    
     #================funtion generate_report render report via ReportGenerator ##########

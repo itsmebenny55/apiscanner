@@ -1,8 +1,8 @@
 ########################################################
 # APISCAN - API Security Scanner                       #
 # Licensed under the AGPL-v3.0                         #
-# Author: Perry Mertens pamsniffer@gmail.com (C) 2025  #
-# version 4.0 26-04-2026                              #
+# Author: Perry Mertens pamsniffer@gmail.com (C) 2026  #
+# version 5.0 24-06-2026                               #
 ########################################################
 
 from __future__ import annotations
@@ -191,7 +191,17 @@ class InventoryAuditor:
     @staticmethod
     #================funtion endpoints_from_swagger description =============
     def endpoints_from_swagger(swagger_path: str) -> List[str]:
-        spec = json.loads(Path(swagger_path).read_text(encoding="utf-8"))
+        raw = Path(swagger_path).read_text(encoding="utf-8")
+        path_lower = str(swagger_path).lower()
+        if path_lower.endswith(('.yml', '.yaml')):
+            import yaml as _yaml
+            spec = _yaml.safe_load(raw) or {}
+        else:
+            try:
+                spec = json.loads(raw)
+            except json.JSONDecodeError:
+                import yaml as _yaml
+                spec = _yaml.safe_load(raw) or {}
         return list((spec.get("paths") or {}).keys())
 
 
@@ -218,12 +228,16 @@ class InventoryAuditor:
         for issue in self._issues:
             if not issue.get("issue") or not issue.get("endpoint"):
                 continue
-            key = (
-                str(issue.get("issue") or ""),
-                str(issue.get("endpoint") or ""),
-                str(issue.get("description") or ""),
-                int(issue.get("status_code") or 0),
-            )
+            issue_name = str(issue.get("issue") or "")
+            endpoint = str(issue.get("endpoint") or "")
+            desc = str(issue.get("description") or "")
+            status = int(issue.get("status_code") or 0)
+            # For structural findings (security headers) that are identical
+            # across all endpoints, deduplicate globally to avoid 104× spam.
+            if "missing security headers" in issue_name.lower():
+                key = (issue_name, desc[:120], status)
+            else:
+                key = (issue_name, endpoint, desc, status)
             if key in seen:
                 continue
             seen.add(key)
@@ -270,8 +284,6 @@ class InventoryAuditor:
         for v in range(1, 12):
             for prefix in (
                 "", "/api", "/rest", "/services",
-                "/orders", "/products", "/users",
-                "/apis", "/app", "/backend",
             ):
                 paths_to_check.append(f"{prefix}/v{v}")
 
@@ -335,17 +347,7 @@ class InventoryAuditor:
                 return
 
 
-        if not self._security_headers_checked:
-            try:
-                self._check_security_headers(resp, url)
-            except Exception as e:
-                if self.logger:
-                    try:
-                        self.logger.debug("Security header check failed for %s: %s", url, e)
-                    except Exception:
-                        pass
-            finally:
-                self._security_headers_checked = True
+        self._check_security_headers(resp, url)
 
         if not self._is_api_response(resp):
             return
@@ -385,8 +387,9 @@ class InventoryAuditor:
             self._log("Debug exposure", "Swagger UI", "", response)
         if "h2-console" in text_lower:
             self._log("Debug exposure", "H2 console", "", response)
-        if "<heap>" in text:
-            self._log("Debug exposure", "Memory dump tag", "", response)
+        # Java heap dump: both literal tag and binary magic bytes (0x4A415641 = "JAVA")
+        if "<heap>" in text or (len(text) > 4 and text[:4] == "JAVA"):
+            self._log("Debug exposure", "Memory dump (heap) accessible", "", response)
         # Stack trace patterns
         if any(p in text_lower for p in ("traceback (most recent", "at java.", "at org.", "at com.", "exception in thread", "null pointer exception", "stacktrace")):
             self._log("Stack trace exposed", "Stack trace in response body", "", response)
@@ -403,23 +406,26 @@ class InventoryAuditor:
 
     #================funtion _check_security_headers description =============
     def _check_security_headers(self, response: requests.Response, path: str) -> None:
-        hdrs = response.headers or {}
-        hdrs_lower = {k.lower(): v for k, v in hdrs.items()}
+        hdrs_lower = {k.lower(): v for k, v in (response.headers or {}).items()}
         missing: List[str] = []
 
         if "strict-transport-security" not in hdrs_lower:
-            missing.append("HSTS")
-        if (hdrs.get("X-Content-Type-Options", "") or "").lower() != "nosniff":
+            # HSTS is irrelevant on localhost/loopback — suppress to avoid
+            # false positives when scanning local dev environments.
+            host_lower = (getattr(self, 'base_url', '') or '').lower()
+            if not any(h in host_lower for h in ('127.0.0.1', 'localhost', '::1', '0.0.0.0')):
+                missing.append("HSTS")
+        if hdrs_lower.get("x-content-type-options", "") != "nosniff":
             missing.append("X-Content-Type-Options")
-        if "X-Frame-Options" not in hdrs and "content-security-policy" not in hdrs_lower:
+        if "x-frame-options" not in hdrs_lower and "content-security-policy" not in hdrs_lower:
             missing.append("X-Frame-Options")
-        if "Content-Security-Policy" not in hdrs:
+        if "content-security-policy" not in hdrs_lower:
             missing.append("CSP")
-        if "Referrer-Policy" not in hdrs:
+        if "referrer-policy" not in hdrs_lower:
             missing.append("Referrer-Policy")
         if "permissions-policy" not in hdrs_lower and "feature-policy" not in hdrs_lower:
             missing.append("Permissions-Policy")
-        cache = (hdrs.get("Cache-Control", "") or "").lower()
+        cache = hdrs_lower.get("cache-control", "")
         if not any(d in cache for d in ("no-store", "no-cache", "private")):
             missing.append("Cache-Control (no-store/no-cache/private)")
 

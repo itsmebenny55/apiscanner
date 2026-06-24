@@ -1,9 +1,8 @@
-
 ########################################################
 # APISCAN - API Security Scanner                       #
 # Licensed under the AGPL-v3.0                         #
-# Author: Perry Mertens pamsniffer@gmail.com (C) 2025  #
-# version 4.0 26-04-2026                              #
+# Author: Perry Mertens pamsniffer@gmail.com (C) 2026  #
+# version 5.0 24-06-2026                               #
 ########################################################
                                                          
 from __future__ import annotations
@@ -16,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Optional, Tuple
 from urllib.parse import urlparse
+
 import requests
 from requests.auth import HTTPBasicAuth, HTTPDigestAuth
 
@@ -225,7 +225,7 @@ def _oauth_authorization_code(args) -> str:
         except Exception:
             pass
 
-                                                                    
+                                                                   
 # ----------------------- Funtion configure_authentication ----------------------------#
 def configure_authentication(args) -> requests.Session:
     sess = requests.Session()
@@ -304,6 +304,14 @@ def configure_authentication(args) -> requests.Session:
             sess.auth = HttpNtlmAuth(user, pwd)
             return sess
         raise AuthConfigError("Invalid NTLM value. Use DOMAIN\\\\user:password or user:password")
+
+    if flow == "form":
+        from form_login import auto_form_login  # lazy import (avoids circular dep)
+        token = auto_form_login(args)
+        if token:
+            sess.headers["Authorization"] = _format_bearer(token.strip())
+        # If token is empty, session cookies are already set (cookie-based auth)
+        return sess
 
     if flow == "auth":
         access_token = _oauth_authorization_code(args)

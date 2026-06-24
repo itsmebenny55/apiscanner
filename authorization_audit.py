@@ -1,8 +1,8 @@
 ########################################################
 # APISCAN - API Security Scanner                       #
 # Licensed under the AGPL-v3.0                         #
-# Author: Perry Mertens pamsniffer@gmail.com (C) 2025  #
-# version 4.0 26-04-2026                              #
+# Author: Perry Mertens pamsniffer@gmail.com (C) 2026  #
+# version 5.0 24-06-2026                               #
 ########################################################
 
 from __future__ import annotations
@@ -262,8 +262,11 @@ class AuthorizationAuditor:
             sec = self._global_security
         if sec is None:
             return None
-        if isinstance(sec, list) and len(sec) == 0:
-            return False
+        if isinstance(sec, list):
+            if len(sec) == 0:
+                return False
+            if len(sec) == 1 and sec[0] == {}:
+                return False
         return True
 
 
@@ -278,14 +281,24 @@ class AuthorizationAuditor:
                 continue
             if template.get("path") and template["path"] in endpoint_path:
                 if "body" in template:
-                    json_data = json.loads(json.dumps(template["body"]))
+                    body = json.loads(json.dumps(template["body"]))
+                    json_data = body
+                    form_data = body
                 template_found = True
                 break
         if not template_found and endpoint.get("request_body"):
             content = endpoint["request_body"].get("content", {})
             if "application/json" in content:
                 schema = content["application/json"].get("schema", {})
-                json_data = self._generate_example_from_schema(schema)
+                example = self._generate_example_from_schema(schema)
+                json_data = example
+                form_data = example
+            if "application/x-www-form-urlencoded" in content:
+                schema = content["application/x-www-form-urlencoded"].get("schema", {})
+                form_data = self._generate_example_from_schema(schema)
+            if "multipart/form-data" in content:
+                schema = content["multipart/form-data"].get("schema", {})
+                form_data = self._generate_example_from_schema(schema)
         if method.upper() == "GET":
             return (None, None)
         return (json_data, form_data)
@@ -324,6 +337,12 @@ class AuthorizationAuditor:
         iterator = tqdm(endpoints, desc="Testing endpoints", unit="endpoint") if show_progress else endpoints
         for ep in iterator:
             self._test_endpoint(ep)
+
+        # ── Guest/anonymous data exposure check (ShinyHunters / Salesforce pattern) ──
+        # Detect misconfigured public endpoints that return CRM/business data
+        # to unauthenticated users — the "uninvited guest" attack vector.
+        self._test_guest_data_exposure(endpoints)
+
         return self._filtered_issues()
 
 
@@ -427,7 +446,9 @@ class AuthorizationAuditor:
 
             if allowed != should:
                 desc = "Unauthorized access" if allowed else "Access denied"
-                sev = "High" if allowed and should is False else "Medium"
+                # HIGH only for actual unauthorized access (security breach)
+                # Access denied = security works → LOW
+                sev = "High" if allowed and should is False else "Low"
                 eff_url = getattr(getattr(r, "request", None), "url", rreq.get("url"))
                 self._log_issue(
                     url=eff_url,
@@ -592,6 +613,91 @@ class AuthorizationAuditor:
             if k not in entry:
                 entry[k] = v
         self.authz_issues.append(entry)
+
+
+    #================funtion _test_guest_data_exposure detect unauthenticated CRM/business data leaks ##########
+    def _test_guest_data_exposure(self, endpoints: List[Dict[str, Any]]) -> None:
+        """Detect ShinyHunters / Salesforce Guest User pattern: public endpoints that
+        return structured business/CRM data to anonymous users.
+
+        The attack: misconfigured Guest User Profile → anonymous access to Aura API
+        → mass exfiltration of Contacts, Accounts, CRM objects. 300-400 orgs breached.
+        """
+        # Fields that indicate CRM/business data (not just generic JSON)
+        CRM_FIELD_PATTERNS = re.compile(
+            r'"(email|phone|mobile|address|contact|account|lead|opportunity|'
+            r'first_?name|last_?name|full_?name|company|organization|'
+            r'ssn|bsn|iban|passport|date_of_birth|birthday|salary|'
+            r'credit_card|payment_method|customer_id|client_id)"',
+            re.IGNORECASE,
+        )
+
+        for ep in (endpoints or [])[:15]:  # sample first 15 to stay fast
+            method = (ep.get("method") or "GET").upper()
+            if method != "GET":
+                continue
+            path = ep.get("path") or urlparse(ep.get("url", "")).path or "/"
+            if self._looks_like_auth_endpoint(path):
+                continue
+
+            url = self._abs_url(path)
+
+            # Anonymous request
+            try:
+                tmp = requests.Session()
+                tmp.verify = getattr(self.session, "verify", True)
+                anon = tmp.get(url, timeout=self.timeout, allow_redirects=False)
+                if anon.status_code != 200:
+                    continue
+                body = anon.text or ""
+                ctype = (anon.headers.get("Content-Type") or "").lower()
+                if "application/json" not in ctype and not body.lstrip().startswith(("{", "[")):
+                    continue
+            except Exception:
+                continue
+
+            # Check for structured CRM/business data
+            crm_hits = CRM_FIELD_PATTERNS.findall(body)
+            if not crm_hits:
+                continue
+
+            # Count objects/records in the response
+            record_count = 0
+            try:
+                data = json.loads(body)
+                if isinstance(data, list):
+                    record_count = len(data)
+                elif isinstance(data, dict):
+                    for v in data.values():
+                        if isinstance(v, list):
+                            record_count = max(record_count, len(v))
+                    if record_count == 0:
+                        record_count = 1  # single object with CRM fields
+            except Exception:
+                record_count = 1
+
+            unique_fields = len(set(h.lower() for h in crm_hits))
+            sev = "Critical" if record_count >= 10 else "High" if record_count >= 3 else "Medium"
+
+            self._log_issue(
+                url=url,
+                description=(
+                    f"Public endpoint returns {record_count} record(s) with "
+                    f"{unique_fields} CRM/business field type(s) to anonymous users "
+                    f"(e.g. {', '.join(sorted(set(crm_hits))[:5])}). "
+                    f"ShinyHunters Guest User / unauthenticated data exposure pattern."
+                ),
+                severity=sev,
+                details={
+                    "method": "GET",
+                    "role": "anonymous",
+                    "vector": "guest-data-exposure",
+                    "record_count": record_count,
+                    "crm_fields": sorted(set(crm_hits)),
+                    "confidence": "high" if unique_fields >= 3 else "medium",
+                },
+                response_obj=anon,
+            )
 
 
     #================funtion generate_report description =============
