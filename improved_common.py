@@ -269,6 +269,7 @@ class AsyncHTTPClient:
         headers: Optional[Dict[str, str]] = None,
         cookies: Optional[Dict[str, str]] = None,
         proxies: Optional[str] = None,
+        proxy_manager: Optional[Any] = None,
         logger: Any = None,
     ):
         self.config = config
@@ -276,6 +277,7 @@ class AsyncHTTPClient:
         self._sem = asyncio.Semaphore(config.concurrency)
         self._limiter = RateLimiter(config.rps)
         self._cache = ResponseCache() if config.cache_responses else None
+        self._proxy_manager = proxy_manager  # IPRoyal or other proxy manager
 
         limits = httpx.Limits(
             max_connections=config.concurrency,
@@ -341,6 +343,11 @@ class AsyncHTTPClient:
             if hit is not None:
                 return hit
 
+        # Determine proxy for this URL (if using proxy_manager)
+        proxy_for_url = None
+        if self._proxy_manager:
+            proxy_for_url = self._proxy_manager.get_proxy(url)
+
         attempt = 0
         last_err: Optional[str] = None
         while attempt <= self.config.retries:
@@ -348,7 +355,25 @@ class AsyncHTTPClient:
                 await self._limiter.acquire()
                 started = time.perf_counter()
                 try:
-                    resp = await self._client.request(
+                    # Use proxy-specific client if needed
+                    client = self._client
+                    if proxy_for_url and proxy_for_url != getattr(self._client, '_proxy', None):
+                        # Create temporary client with specific proxy for this request
+                        limits = httpx.Limits(
+                            max_connections=1,
+                            max_keepalive_connections=1,
+                        )
+                        client = httpx.AsyncClient(
+                            proxy=proxy_for_url,
+                            timeout=httpx.Timeout(self.config.timeout),
+                            verify=self.config.verify_tls,
+                            follow_redirects=self.config.follow_redirects,
+                            max_redirects=self.config.max_redirects,
+                            limits=limits,
+                            headers=self._client._mounts or {},
+                        )
+
+                    resp = await client.request(
                         method.upper(),
                         url,
                         params=params,
@@ -356,6 +381,10 @@ class AsyncHTTPClient:
                         data=data,
                         headers=headers,
                     )
+
+                    # Close temporary client
+                    if proxy_for_url and client != self._client:
+                        await client.aclose()
                     elapsed = time.perf_counter() - started
                     body = resp.text or ""
                     if len(body) > self.config.response_body_limit * 4:
