@@ -1,0 +1,8 @@
+{
+  "_instructions": "Copy this file to captcha_answers.json and fill in with your CAPTCHA samples. Key = filename (without .png), Value = expected text answer.",
+  "captcha_001": "A7x2K",
+  "captcha_002": "B9mL3",
+  "captcha_003": "C5qP7",
+  "captcha_004": "D4rN8",
+  "captcha_005": "E6sM9"
+}
