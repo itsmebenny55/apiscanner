@@ -25,7 +25,7 @@ import csv as _csv
 import re as _re
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
@@ -66,8 +66,11 @@ except ImportError:
 #================funtion clear_screen clear_screen =============
 def clear_screen():
     os.system('cls' if os.name == 'nt' else 'clear')
-clear_screen()
-print('Loading APISCAN one-moment')
+# Only clear/print when run as the CLI, so other tools can import the redaction
+# helpers (and other utilities) from this module without side effects.
+if __name__ == '__main__':
+    clear_screen()
+    print('Loading APISCAN one-moment')
 
 try:
     from colorama import Fore, Style, init as _colorama_init
@@ -81,27 +84,67 @@ except Exception:
     Fore = _Dummy()
     Style = _Dummy()
 from requests.adapters import HTTPAdapter
+# ================= AUDITOR IMPORTS (improved versions with fallback to legacy) =================
+_AUDITOR_IMPORT_ERRORS = []
+
 try:
-    from bola_audit import BOLAAuditor
-    from broken_auth_audit import AuthAuditor
+    # Try improved versions first (async, LLM-powered, bleeding-edge)
+    try:
+        from improved_bola_audit import BOLAAuditor
+        logger_init = logging.getLogger(__name__)
+        logger_init.info('Using improved BOLAAuditor (async)')
+    except ImportError:
+        from bola_audit import BOLAAuditor
+
+    try:
+        from improved_broken_auth_audit import AuthAuditor
+    except ImportError:
+        from broken_auth_audit import AuthAuditor
+
+    try:
+        from improved_ssrf_audit import SSRFAuditor
+    except ImportError:
+        from ssrf_audit import SSRFAuditor
+
+    # Legacy-only auditors (no improved versions yet)
     from broken_object_property_audit import ObjectPropertyAuditor
     from resource_consumption_audit import ResourceConsumptionAuditor as ResourceAuditor
     from authorization_audit import AuthorizationAuditor
     from business_flow_audit import BusinessFlowAuditor
-    from ssrf_audit import SSRFAuditor
     from misconfiguration_audit import MisconfigurationAuditorPro as MisconfigurationAuditor
     from inventory_audit import InventoryAuditor
     from safe_consumption_audit import SafeConsumptionAuditor
+
     from version import __version__
     from auth_utils import configure_authentication, AuthConfigError
     from report_utils import HTMLReportGenerator, RISK_INFO
     from doc_generator import generate_combined_html
     from swagger_utils import enable_dummy_mode, extract_variables, write_variables_file
     from openapi_universal import iter_operations as oas_iter_ops, build_request as oas_build_request, SecurityConfig as OASSecurityConfig, load_spec as oas_load_spec
+    from stealth_session import create_stealth_session, enhance_with_stealth
+    from stealth_integration import create_full_stealth_session, enhance_session_with_full_stealth
 except ImportError as e:
     print(f'Error importing required modules: {e}')
     print('Please ensure all audit modules are available in the Python path.')
     sys.exit(1)
+
+# ================= CAPTCHA SOLVER IMPORTS (improved versions with fallback) =================
+try:
+    # Try improved versions first (Turnstile support, Vision API, browser automation)
+    try:
+        from improved_captcha_solver import UnifiedAsyncCaptchaSolver
+        from improved_gdt_captcha_solver import AsyncGDTCaptchaSolver
+    except ImportError:
+        try:
+            from captcha_solver import UnifiedAsyncCaptchaSolver
+            from gdt_captcha_solver import AsyncGDTCaptchaSolver
+        except ImportError:
+            UnifiedAsyncCaptchaSolver = None
+            AsyncGDTCaptchaSolver = None
+except Exception:
+    UnifiedAsyncCaptchaSolver = None
+    AsyncGDTCaptchaSolver = None
+
 try:
     import colorama
     colorama.just_fix_windows_console()
@@ -296,6 +339,25 @@ _ID_MAP = {}
 MISSING_RE = _re.compile('(missing|require[sd])\\s+[\'\\"]?([A-Za-z0-9_]+)[\'\\"]?', _re.I)
 logger = logging.getLogger('apiscan')
 
+
+def _utc_now_iso() -> str:
+    # Timezone-aware UTC timestamp; keeps the historical '...Z' suffix format.
+    return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+# Severity ranking used both in Python and inlined into SQL (upsert severity max).
+_SEVERITY_ORDER = {'critical': 4, 'high': 3, 'medium': 2, 'low': 1, 'info': 0, '': -1}
+
+
+def _sev_rank_case_sql(col: str) -> str:
+    """SQL CASE expression mapping a severity column to its numeric rank."""
+    return (
+        "CASE LOWER(COALESCE(" + col + ",'')) "
+        "WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 "
+        "WHEN 'low' THEN 1 WHEN 'info' THEN 0 ELSE -1 END"
+    )
+
+
 class EvidenceDatabase:
 
     #================funtion __init__ __init__ =============
@@ -340,33 +402,67 @@ class EvidenceDatabase:
 
     #================funtion record_endpoint record_endpoint =============
     def record_endpoint(self, method: str, url: str, run_id: str | None=None, severity: str | None=None, status: int | None=None, ms: int | None=None, ok: bool | None=None) -> None:
-        now = datetime.utcnow().isoformat(timespec='seconds') + 'Z'
+        # Single-statement atomic upsert. Avoids the previous read-modify-write
+        # race on max_severity when the shared connection is used concurrently.
+        self.record_endpoints_bulk(
+            [(method, url, severity, status, ms)],
+            run_id=run_id,
+        )
+
+    #================funtion record_endpoints_bulk record_endpoints_bulk =============
+    def record_endpoints_bulk(self, items, run_id: str | None=None) -> None:
+        """Upsert many endpoints in one transaction.
+
+        Each item is a dict with keys (method, url, severity, status, ms) or a
+        tuple/list in that order. max_severity is only ever raised, never lowered,
+        and last_status/last_ms are preserved when the new value is None.
+        """
         run_id = run_id or self.run_id or ''
-        sev = (severity or '').strip().lower()
-        order = {'critical': 4, 'high': 3, 'medium': 2, 'low': 1, 'info': 0, '': -1, None: -1}
+        now = _utc_now_iso()
+        rows = []
+        for it in items or []:
+            if isinstance(it, dict):
+                method = it.get('method'); url = it.get('url'); severity = it.get('severity')
+                status = it.get('status'); ms = it.get('ms')
+            else:
+                vals = list(it) + [None] * 5
+                method, url, severity, status, ms = vals[:5]
+            if not url:
+                continue
+            sev = (str(severity or '').strip().lower()) or None
+            rows.append((run_id, str(method or 'GET').upper(), url, now, now, sev, status, ms))
+        if not rows:
+            return
+        rank_new = _sev_rank_case_sql('excluded.max_severity')
+        rank_old = _sev_rank_case_sql('endpoint.max_severity')
+        sql = (
+            'INSERT INTO endpoint(run_id, method, url, first_seen, last_seen, max_severity, last_status, last_ms) '
+            'VALUES (?,?,?,?,?,?,?,?) '
+            'ON CONFLICT(run_id, method, url) DO UPDATE SET '
+            'last_seen=excluded.last_seen, '
+            'last_status=COALESCE(excluded.last_status, endpoint.last_status), '
+            'last_ms=COALESCE(excluded.last_ms, endpoint.last_ms), '
+            f'max_severity=CASE WHEN {rank_new} > {rank_old} THEN excluded.max_severity ELSE endpoint.max_severity END'
+        )
         cur = self.conn.cursor()
-        cur.execute('SELECT max_severity FROM endpoint WHERE run_id=? AND method=? AND url=?', (run_id, method, url))
-        row = cur.fetchone()
-        if row:
-            old = (row[0] or '').lower()
-            keep = sev if order.get(sev, -1) > order.get(old, -1) else old
-            cur.execute(
-                'UPDATE endpoint SET last_seen=?, max_severity=?, last_status=?, last_ms=? WHERE run_id=? AND method=? AND url=?',
-                (now, keep or None, status, ms, run_id, method, url)
-            )
-        else:
-            cur.execute(
-                'INSERT INTO endpoint(run_id, method, url, first_seen, last_seen, max_severity, last_status, last_ms) VALUES (?,?,?,?,?,?,?,?)',
-                (run_id, method, url, now, now, sev or None, status, ms)
-            )
-        self.conn.commit()
+        # Connection is in autocommit mode (isolation_level=None), so drive the
+        # transaction explicitly to make the batch atomic.
+        try:
+            cur.execute('BEGIN')
+            cur.executemany(sql, rows)
+            cur.execute('COMMIT')
+        except Exception:
+            try:
+                cur.execute('ROLLBACK')
+            except Exception:
+                pass
+            raise
 
     #================funtion store_issues store_issues =============
     def store_issues(self, category: str, issues, base_url: str | None=None) -> None:
         if not issues:
             return
-        from datetime import datetime as _dt
-        now = _dt.utcnow().isoformat(timespec='seconds') + 'Z'
+        now = _utc_now_iso()
         import json as _json
         prepared = []
         for it in issues:
@@ -463,23 +559,16 @@ class EvidenceDatabase:
             ))
         cur = self.conn.cursor()
         cur.executemany('INSERT INTO finding(run_id, risk_key, title, description, category, severity, status, method, endpoint, req_headers, req_body, res_headers, res_body, res_status, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', rows)
-# Update endpoint.max_severity based on inserted findings for this category + run
+        # Propagate each finding's severity onto the endpoint inventory so the
+        # review's inventory table reflects the worst severity seen per endpoint.
+        # record_endpoints_bulk only ever raises max_severity, never lowers it.
         try:
-            cur.execute("""
-                SELECT method, endpoint, MAX(
-                    CASE LOWER(severity)
-                        WHEN 'critical' THEN 4
-                        WHEN 'high' THEN 3
-                        WHEN 'medium' THEN 2
-                        WHEN 'low' THEN 1
-                        WHEN 'info' THEN 0
-                        ELSE -1
-                    END
-                ) AS max_rank
-                FROM finding
-                WHERE run_id = ? AND category = ?
-                GROUP BY method, endpoint
-            """, (run_id, category))
+            prop = [
+                (item['method'], item['endpoint'], item['sev'], None, None)
+                for item in deduped.values()
+                if item.get('endpoint')
+            ]
+            self.record_endpoints_bulk(prop)
         except Exception:
             pass
 
@@ -838,12 +927,12 @@ def _filter_auth_issues_min(issues):
     return list(dedup.values())
 
 #================funtion check_api_reachable check_api_reachable =============
-def check_api_reachable(url: str, session: requests.Session, retries: int=3, delay: int=3) -> None:
+def check_api_reachable(url: str, session: requests.Session, retries: int=3, delay: int=3, timeout: float=5.0) -> None:
     safe_url = _redact_url(url)
     for attempt in range(1, retries + 1):
         try:
             styled_print(f'Connecting to {safe_url}  (attempt {attempt}/{retries})', 'run')
-            resp = session.get(url, timeout=5, verify=getattr(session, 'verify', True))
+            resp = session.get(url, timeout=timeout, verify=getattr(session, 'verify', True))
             code = resp.status_code
             if not resp.content:
                 styled_print('Empty response body from server', 'warn')
@@ -1294,9 +1383,14 @@ def auto_generate_swagger(args, output_dir: Path | None=None) -> str:
     if effective_aggressive and not getattr(args, 'crawl_aggressive', False):
         print('[*] Crawl draait in aggressive modus (default). Gebruik --crawl-passive voor lichtere crawl.')
 
+    # Apply stealth-aware crawl delay (prevent detection during endpoint discovery)
+    crawl_delay = getattr(args, 'request_delay', 0.0) or 0.5  # Default 0.5s if full-stealth is enabled
+    if getattr(args, 'full_stealth', False):
+        crawl_delay = max(crawl_delay, 0.5)  # Enforce minimum 0.5s delay for stealth
+
     generator = UltimateSwaggerGenerator(
         base_url=args.url,
-        delay=0.0,
+        delay=crawl_delay,
         aggressive=effective_aggressive,
         insecure=bool(getattr(args, 'insecure', False))
     )
@@ -1307,6 +1401,26 @@ def auto_generate_swagger(args, output_dir: Path | None=None) -> str:
     if getattr(args, 'apikey', None):
         header = getattr(args, 'apikey_header', 'X-API-Key')
         generator.set_custom_header(header, args.apikey)
+
+    # Apply stealth headers during crawl to avoid detection
+    if getattr(args, 'randomize_headers', True):
+        # Randomize User-Agent for crawl
+        user_agents = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15'
+        ]
+        import random as _rand
+        user_agent = _rand.choice(user_agents)
+        generator.session.headers.update({
+            'User-Agent': user_agent,
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache'
+        })
 
     generator.crawl(
         max_depth=getattr(args, 'crawl_depth', 3),
@@ -1337,6 +1451,23 @@ def validate_crawled_swagger(swagger_path: str, args, output_dir: Path | None=No
         session = configure_authentication(args)
     except Exception:
         session = requests.Session()
+
+    # Apply stealth enhancements
+    try:
+        stealth_mode = getattr(args, 'stealth_mode', 'basic')
+        if stealth_mode != 'off':
+            use_full_stealth = getattr(args, 'full_stealth', False)
+            has_advanced = any([
+                getattr(args, 'payload_obfuscation', False),
+                getattr(args, 'behavioral_randomization', False),
+                getattr(args, 'proxy_pool', None),
+            ])
+            if use_full_stealth or has_advanced:
+                session = enhance_session_with_full_stealth(session, args)
+            else:
+                session = enhance_with_stealth(session, args)
+    except Exception as e:
+        logger.debug(f'Stealth setup warning: {e}')
 
     try:
         session.verify = not getattr(args, 'insecure', False)
@@ -1650,7 +1781,14 @@ def main() -> None:
     parser.add_argument(
         '--crawl',
         action='store_true',
-        help='Auto-generate Swagger spec by crawling target before scanning'
+        default=True,
+        help='Auto-generate Swagger spec by crawling target before scanning (default: enabled. Use --no-crawl to disable)'
+    )
+    parser.add_argument(
+        '--no-crawl',
+        dest='crawl',
+        action='store_false',
+        help='Disable endpoint crawl/discovery'
     )
     parser.add_argument(
         '--crawl-depth',
@@ -1661,12 +1799,14 @@ def main() -> None:
     parser.add_argument(
         '--crawl-aggressive',
         action='store_true',
-        help='Enable aggressive crawl mode (brute-force common endpoints)'
+        default=True,
+        help='Enable aggressive crawl mode - brute-force common endpoints (default: enabled. Use --crawl-passive to disable)'
     )
     parser.add_argument(
         '--crawl-passive',
-        action='store_true',
-        help='Disable default aggressive crawl behavior and use lighter discovery only'
+        dest='crawl_aggressive',
+        action='store_false',
+        help='Disable aggressive crawl; use lighter discovery only'
     )
     parser.add_argument(
         '--crawl-validate',
@@ -1726,7 +1866,38 @@ def main() -> None:
     parser.add_argument('--dummy', action='store_true', help='Use dummy data for request bodies and parameters')
     parser.add_argument('--export_vars', metavar='PATH', help='Export variables template YAML if .yml/.yaml else JSON')
     parser.add_argument('--proxy', help='Optional proxy URL, e.g. http://127.0.0.1:8080')
+    # Stealth mode arguments
+    parser.add_argument('--stealth-mode', choices=['off', 'basic', 'aggressive'], default='basic', help='Detection evasion level: off (no stealth), basic (header randomization + delays), aggressive (all features + TLS variation)')
+    parser.add_argument('--request-delay', type=float, default=0.0, help='Fixed delay between requests (seconds)')
+    parser.add_argument('--request-jitter', type=float, default=0.0, help='Random jitter (0-N seconds) added to delay')
+    parser.add_argument('--rate-limit', type=float, default=5.0, help='Max requests per second (default: 5.0 for stealth mode)')
+    parser.add_argument('--randomize-headers', action='store_true', default=True, help='Randomize HTTP headers (User-Agent, Accept-Language, etc.)')
+    parser.add_argument('--no-randomize-headers', dest='randomize_headers', action='store_false', help='Disable header randomization')
+    parser.add_argument('--tls-variation', action='store_true', default=True, help='Vary TLS fingerprint (cipher order, TLS version)')
+    parser.add_argument('--no-tls-variation', dest='tls_variation', action='store_false', help='Disable TLS fingerprinting variation')
+    parser.add_argument('--user-agent-pool', help='Path to file with custom User-Agent list (one per line)')
+    # Advanced stealth features
+    parser.add_argument('--payload-obfuscation', action='store_true', default=True, help='Obfuscate request payloads (randomize parameter order only)')
+    parser.add_argument('--no-payload-obfuscation', dest='payload_obfuscation', action='store_false', help='Disable payload obfuscation')
+    parser.add_argument('--enable-payload-noise', dest='enable_payload_noise', action='store_true', default=False, help='RISKY, off by default: inject junk _xNNN parameters into request bodies. Can break strict-schema APIs (400s) and trip WAF tampering rules; only enable if the target tolerates extra fields.')
+    parser.add_argument('--behavioral-randomization', action='store_true', default=True, help='Randomize scanning behavior (endpoint order, pauses)')
+    parser.add_argument('--no-behavioral-randomization', dest='behavioral_randomization', action='store_false', help='Disable behavioral randomization')
+    parser.add_argument('--protocol-variation', action='store_true', default=True, help='Vary HTTP protocol characteristics')
+    parser.add_argument('--no-protocol-variation', dest='protocol_variation', action='store_false', help='Disable protocol variation')
+    parser.add_argument('--captcha-detection', action='store_true', default=True, help='Detect and handle CAPTCHA challenges')
+    parser.add_argument('--no-captcha-detection', dest='captcha_detection', action='store_false', help='Disable CAPTCHA detection')
+    parser.add_argument('--response-analysis', action='store_true', default=True, help='Analyze responses and adapt strategy')
+    parser.add_argument('--no-response-analysis', dest='response_analysis', action='store_false', help='Disable response analysis')
+    parser.add_argument('--ml-fingerprinting', action='store_true', default=True, help='Learn legitimate traffic patterns (ML-based)')
+    parser.add_argument('--no-ml-fingerprinting', dest='ml_fingerprinting', action='store_false', help='Disable ML fingerprinting')
+    parser.add_argument('--proxy-pool', help='Path to file with proxy list (one per line) for rotation')
+    parser.add_argument('--distributed-mode', action='store_true', help='Enable distributed scanning coordination')
+    parser.add_argument('--instance-id', default='default', help='Instance ID for distributed scanning')
+    parser.add_argument('--full-stealth', action='store_true', default=True, help='Enable all advanced stealth features (default: enabled. Use --no-full-stealth to disable)')
+    parser.add_argument('--no-full-stealth', dest='full_stealth', action='store_false', help='Disable full stealth mode')
     parser.add_argument('--headers-file', help='Path to JSON file with header overrides')
+    parser.add_argument('--extra-header', action='append', default=[], metavar='NAME:VALUE', help='Extra HTTP header applied to every request (repeatable, e.g. --extra-header "X-Trace: 1")')
+    parser.add_argument('--no-open', action='store_true', help='Do not auto-open the HTML review report in a browser when the scan finishes')
     parser.add_argument('--ids-file', help='JSON file mapping path parameter names to concrete values')
     parser.add_argument('--rewrite', action='append', default=[], help='Regex=>replacement rewrite applied to each URL (can be repeated)')
     parser.add_argument('--no-sanitize', action='store_true', help='Disable built-in URL normalization; only apply explicit --rewrite rules')
@@ -1855,6 +2026,33 @@ def main() -> None:
         if getattr(args, 'debug', False):
             logger.exception('Authentication setup exception')
         sys.exit(2)
+
+    # Apply stealth enhancements
+    try:
+        stealth_mode = getattr(args, 'stealth_mode', 'basic')
+        use_full_stealth = getattr(args, 'full_stealth', False)
+        has_advanced_features = any([
+            getattr(args, 'payload_obfuscation', False),
+            getattr(args, 'behavioral_randomization', False),
+            getattr(args, 'protocol_variation', False),
+            getattr(args, 'proxy_pool', None),
+            getattr(args, 'distributed_mode', False),
+        ])
+
+        if stealth_mode != 'off':
+            if use_full_stealth or has_advanced_features:
+                # Use full stealth with all advanced features
+                sess = enhance_session_with_full_stealth(sess, args)
+                styled_print('Full stealth mode enabled (all features active)', 'info')
+            else:
+                # Use basic stealth
+                sess = enhance_with_stealth(sess, args)
+                styled_print(f'Stealth mode enabled: {stealth_mode}', 'info')
+    except Exception as e:
+        logger.warning(f'Failed to apply stealth mode: {e}')
+        if getattr(args, 'debug', False):
+            logger.exception('Stealth mode setup exception')
+
     try:
         sess.verify = not args.insecure
     except Exception:
@@ -1883,7 +2081,17 @@ def main() -> None:
     adapter = HTTPAdapter(pool_connections=args.threads * 4, pool_maxsize=args.threads * 4, max_retries=_retry)
     sess.mount('http://', adapter)
     sess.mount('https://', adapter)
-    check_api_reachable(args.url, sess)
+    # Apply --extra-header / --headers-file / apikey overrides to every request
+    # made through this session (previously only honored in the verify-plan path).
+    try:
+        _overrides = _merge_header_overrides(args)
+        for _lk, (_orig, _val) in _overrides.items():
+            sess.headers[_orig] = _val
+        if _overrides:
+            logger.debug('Applied %d header override(s) to scan session', len(_overrides))
+    except Exception as e:
+        logger.warning('Failed to apply header overrides: %s', e)
+    check_api_reachable(args.url, sess, timeout=getattr(args, 'timeout', 5.0))
     try:
         swagger_path = Path(args.swagger).resolve()
         if not swagger_path.exists():
@@ -2107,7 +2315,7 @@ def main() -> None:
         has_auth = bool(
             (getattr(args, 'token', None) or '').lower() not in ('', 'none')
             or getattr(args, 'apikey', None)
-            or getattr(args, 'auth', None) not in (None, 'none')
+            or getattr(args, 'flow', None) not in (None, 'none')
         )
         if not has_auth:
             styled_print('API7 SSRF skipped – no authentication configured (use --token for SSRF scans)', 'warn')
@@ -2165,6 +2373,7 @@ def main() -> None:
         if db is not None:
             from urllib.parse import urljoin as _uij
             try:
+                _ep_batch = []
                 for _se in safe_eps:
                     try:
                         _m = (_se.get('method') or _se.get('http_method') or 'GET').upper()
@@ -2172,9 +2381,11 @@ def main() -> None:
                         if not _p:
                             continue
                         _u = _p if _p.startswith('http') else _uij(args.url.rstrip('/') + '/', _p.lstrip('/'))
-                        db.record_endpoint(_m, _u, run_id=run_id)
+                        _ep_batch.append((_m, _u, None, None, None))
                     except Exception:
                         pass
+                # One transaction for all API10 endpoints instead of per-row commits.
+                db.record_endpoints_bulk(_ep_batch, run_id=run_id)
             except Exception:
                 pass
         sc = SafeConsumptionAuditor(base_url=args.url, session=sess)

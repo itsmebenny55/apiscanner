@@ -2,6 +2,10 @@
 requests>=2.31.0
 urllib3>=2.2.0
 tqdm>=4.66.0
+# SOCKS5 support for VN egress lanes (socks5h:// proxying via requests)
+PySocks>=1.7.1
+# TLS (JA3/JA4) + HTTP/2 browser fingerprint impersonation
+curl_cffi>=0.5.0
 
 # Authentication
 requests_ntlm>=1.2.0
@@ -13,24 +17,66 @@ sslyze>=6.2.0
 # Parsing & HTML
 beautifulsoup4>=4.12.2
 lxml>=4.9.3
-
-# Output & kleur
-colorama>=0.4.6
-markdown2>=2.4.10
 httpx>=0.27.0
 
-# AI Client
+# --------------------------------------------------------------------------- #
+# Modernized async audit stack (improved_*_audit.py + improved_common.py)
+# All are imported lazily and degrade gracefully; installing them enables the
+# corresponding feature (browser probing, structured logs, graph correlation,
+# LLM fuzzing, WebSocket testing).
+# --------------------------------------------------------------------------- #
+# Async HTTP concurrency (httpx above is the core; h2 enables HTTP/2)
+h2>=4.1.0
+# Structured logging
+structlog>=24.1.0
+# Graph-based vulnerability correlation
+networkx>=3.2
+# Browser-based detection for JS-heavy / WAF-protected endpoints
+#   after install run:  python -m playwright install chromium
+playwright>=1.44.0
+# Real-time WebSocket API testing
+websockets>=12.0
+# LLM-based payload generation uses the `anthropic` client (see AI Clients below)
+
+# --------------------------------------------------------------------------- #
+# Async CAPTCHA solvers (improved_captcha_solver.py +                          #
+# improved_gdt_captcha_solver.py). Turnstile / reCAPTCHA / hCaptcha token      #
+# solving needs only httpx (above) + a commercial service API key. The         #
+# following extras enable the optional legs and all degrade gracefully.        #
+# --------------------------------------------------------------------------- #
+# pyppeteer is an alternative headless-Chromium driver (Playwright above is the
+# primary browser used to harvest Turnstile / reCAPTCHA tokens in a real page).
+pyppeteer>=2.0.0
+# Local image-CAPTCHA OCR fallback (any subset works; each missing one is skipped)
+pytesseract>=0.3.10          # needs the `tesseract` binary (brew install tesseract)
+easyocr>=1.7.0
+amazoncaptcha>=0.5.11
+pillow>=10.0.0
+# Optional commercial-solver env keys (no package needed - plain HTTP APIs):
+#   CAPSOLVER_API_KEY, 2CAPTCHA_API_KEY (or TWOCAPTCHA_API_KEY), ANTICAPTCHA_API_KEY
+# Vision image-CAPTCHA solving reuses the `anthropic` client + ANTHROPIC_API_KEY.
+
+# Output
+colorama>=0.4.6
+markdown2>=2.4.10
+
+# AI Clients
 openai>=1.0.0,<2.0.0
-azure-identity>=1.16.0
+anthropic>=0.67.0
 
 # Typing & util
-orjson>=3.9.0; python_version>="3.8"   # optional: 3-5x faster JSON parsing
 python-dateutil>=2.8.2
+typing_extensions>=4.15.0
 PyYAML>=6.0.2
-anthropic>=0.67.0
 openapi-spec-validator>=0.7.2
 tenacity>=8.2.0
-cachetools>=5.3.0
 python-dotenv>=1.0.0
 pydantic>=2.0.0
-typing_extensions>=4.15.0
+# Unified config (config.Config loads from env/.env/CLI via BaseSettings)
+pydantic-settings>=2.0
+
+# Testing (see testing/ + Makefile `make test`)
+pytest>=7.0
+pytest-cov>=4.0
+# Required by the async auditor tests (test_improved_*.py use @pytest.mark.asyncio)
+pytest-asyncio>=0.23
