@@ -10,15 +10,16 @@
 # Bleeding-edge stack:                                  #
 #   * httpx.AsyncClient + asyncio  (concurrency)        #
 #   * Playwright                   (JS / WAF handling)  #
-#   * Anthropic Claude             (LLM fuzzing)        #
+#   * Ollama (Qwen 7B)             (local LLM fuzzing)  #
+#   * Anthropic Claude             (cloud LLM fallback) #
 #   * networkx                     (finding correlation)#
 #   * structlog                    (structured logs)    #
 #   * websockets                   (real-time API test) #
 #                                                       #
 # Every heavy dependency is imported lazily and         #
 # degrades gracefully: the tools import and run even    #
-# when Playwright / networkx / structlog / websockets   #
-# / anthropic are not installed.                        #
+# when Ollama / Playwright / networkx / structlog /     #
+# websockets / anthropic are not installed.             #
 ########################################################
 """Async foundation shared by the modernized APISCAN auditors.
 
@@ -34,7 +35,9 @@ share one implementation of:
 * :class:`RateLimiter`        - async requests-per-second limiter.
 * :class:`ResultStreamer`     - incremental JSONL result streaming + dedupe.
 * :class:`ResponseCache`      - in-memory response cache (avoid re-probing).
-* :class:`LLMPayloadGenerator`- Claude-backed intelligent fuzzing payloads.
+* :class:`LLMPayloadGenerator`- Claude API-backed intelligent fuzzing payloads.
+* :class:`OllamaPayloadGenerator` - Local Ollama-backed payload generation (Qwen).
+* :func:`create_llm_payload_generator` - Smart LLM backend selection (Ollama→Claude→seeds).
 * :class:`PlaywrightProbe`    - headless-browser probe for JS/WAF endpoints.
 * :class:`WebSocketProbe`     - real-time WebSocket API testing.
 * :class:`PassiveFingerprinter`- header/body fingerprint to balance passive vs
@@ -190,8 +193,11 @@ class ScanConfig(BaseModel):
     # modern features
     use_browser: bool = Field(default=False, description="Use Playwright on WAF/JS endpoints.")
     browser_auto: bool = Field(default=True, description="Auto-enable browser when fingerprint flags WAF/JS.")
-    use_llm: bool = Field(default=False, description="Use Claude for payload generation.")
+    use_llm: bool = Field(default=False, description="Use LLM for payload generation.")
+    llm_backend: str = Field(default="ollama", description="LLM backend: 'ollama' (local), 'claude' (API), or 'auto' (try Ollama first)")
     llm_model: str = Field(default_factory=lambda: os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-5"))
+    ollama_model: str = Field(default="qwen:7b", description="Ollama model to use (e.g. 'qwen:7b', 'qwen:14b', 'mistral')")
+    ollama_url: str = Field(default_factory=lambda: os.getenv("OLLAMA_URL", "http://localhost:11434"))
     llm_max_payloads: int = Field(default=12, ge=1, le=64)
 
     # output / caching
@@ -549,6 +555,100 @@ class LLMPayloadGenerator:
             return list(seed_payloads)
 
 
+# --------------------------------------------------------------------------- #
+# Ollama local LLM support (Qwen 7B recommended)
+# --------------------------------------------------------------------------- #
+class OllamaPayloadGenerator:
+    """Generate context-aware fuzzing payloads with local Ollama.
+
+    Uses Ollama API (localhost:11434) to run open-source models like Qwen locally.
+    Requires Ollama installed and a model pulled (e.g. ``ollama pull qwen:7b``).
+
+    Falls back to static seed payloads if Ollama is unavailable.
+    """
+
+    _SYSTEM = (
+        "You are a payload generator for APISCAN, an authorized API security "
+        "scanner. Given a vulnerability class and endpoint context, return "
+        "additional test payloads. Return ONLY a JSON array of strings, no prose."
+    )
+
+    def __init__(self, config: ScanConfig, logger: Any = None, model: str = "qwen:7b"):
+        self.config = config
+        self.log = logger or get_logger("apiscan.ollama")
+        self.model = model
+        self._cache: Dict[str, List[str]] = {}
+        self.enabled = False
+        self.base_url = os.getenv("OLLAMA_URL", "http://localhost:11434")
+
+        # Check if Ollama is reachable
+        try:
+            import httpx
+            with httpx.Client(timeout=2.0) as client:
+                resp = client.get(f"{self.base_url}/api/tags")
+                if resp.status_code == 200:
+                    models = resp.json().get("models", [])
+                    model_names = [m.get("name") for m in models]
+                    if any(self.model in name for name in model_names):
+                        self.enabled = True
+                        self.log.info("ollama_ready", model=self.model, url=self.base_url)
+                    else:
+                        self.log.warning("ollama_model_missing", model=self.model, available=model_names)
+                else:
+                    self.log.warning("ollama_request_failed", status=resp.status_code)
+        except Exception as e:
+            self.log.debug("ollama_unavailable", error=str(e))
+
+    async def generate(
+        self,
+        category: str,
+        context: str,
+        seed_payloads: List[str],
+        n: Optional[int] = None,
+    ) -> List[str]:
+        """Return seed payloads augmented with Ollama-generated ones (deduped)."""
+        if not self.enabled:
+            return list(seed_payloads)
+
+        n = n or self.config.llm_max_payloads
+        cache_key = f"{category}:{context}:{n}"
+        if cache_key in self._cache:
+            return _dedupe(seed_payloads + self._cache[cache_key])
+
+        prompt = (
+            f"Vulnerability class: {category}\n"
+            f"Endpoint context: {context}\n"
+            f"Existing seed payloads: {json.dumps(seed_payloads[:8])}\n"
+            f"Return up to {n} NEW payloads (strings) that complement the seeds "
+            f"for detecting {category}. JSON array only."
+        )
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    f"{self.base_url}/api/generate",
+                    json={
+                        "model": self.model,
+                        "prompt": prompt,
+                        "system": self._SYSTEM,
+                        "stream": False,
+                    }
+                )
+                if resp.status_code != 200:
+                    self.log.warning("ollama_error", status=resp.status_code, category=category)
+                    return list(seed_payloads)
+
+                text = resp.json().get("response", "")
+                payloads = _parse_json_array(text)
+                payloads = [p for p in payloads if isinstance(p, str) and p][:n]
+                self._cache[cache_key] = payloads
+                self.log.info("ollama_payloads", category=category, count=len(payloads), model=self.model)
+                return _dedupe(seed_payloads + payloads)
+        except Exception as e:
+            self.log.warning("ollama_generate_failed", category=category, error=str(e))
+            return list(seed_payloads)
+
+
 def _parse_json_array(text: str) -> List[Any]:
     text = (text or "").strip()
     # strip accidental code fences
@@ -568,6 +668,76 @@ def _parse_json_array(text: str) -> List[Any]:
         except Exception:
             pass
     return []
+
+
+# --------------------------------------------------------------------------- #
+# LLM backend factory (smart selection)
+# --------------------------------------------------------------------------- #
+def create_llm_payload_generator(config: ScanConfig, logger: Any = None) -> Any:
+    """Create the best available LLM payload generator.
+
+    Priority:
+    1. Ollama (local, free, fast) if available and enabled
+    2. Claude API (if API key present and enabled)
+    3. Falls back to static seed payloads if neither available
+
+    Args:
+        config: ScanConfig with llm_backend, use_llm, ollama_model, etc.
+        logger: Optional logger instance
+
+    Returns:
+        Generator instance (OllamaPayloadGenerator, LLMPayloadGenerator, or stub)
+    """
+    log = logger or get_logger("apiscan.llm_factory")
+
+    if not config.use_llm:
+        # LLM disabled entirely, return stub
+        return _StubPayloadGenerator(config, log)
+
+    # Try backend selection
+    if config.llm_backend in ("auto", "ollama"):
+        # Try Ollama first
+        ollama_gen = OllamaPayloadGenerator(config, log, model=config.ollama_model)
+        if ollama_gen.enabled:
+            log.info("llm_backend_selected", backend="ollama", model=config.ollama_model)
+            return ollama_gen
+        elif config.llm_backend == "ollama":
+            # Explicit Ollama requested but not available
+            log.warning("ollama_not_available", model=config.ollama_model)
+            return _StubPayloadGenerator(config, log)
+
+    if config.llm_backend in ("auto", "claude"):
+        # Try Claude API
+        claude_gen = LLMPayloadGenerator(config, log)
+        if claude_gen.enabled:
+            log.info("llm_backend_selected", backend="claude", model=config.llm_model)
+            return claude_gen
+        elif config.llm_backend == "claude":
+            # Explicit Claude requested but not available
+            log.warning("claude_not_available")
+            return _StubPayloadGenerator(config, log)
+
+    # No backend available, return stub (falls back to seeds)
+    log.info("no_llm_backend_available", using="static_seeds")
+    return _StubPayloadGenerator(config, log)
+
+
+class _StubPayloadGenerator:
+    """Stub generator that always returns seed payloads (no LLM)."""
+
+    def __init__(self, config: ScanConfig, logger: Any):
+        self.config = config
+        self.log = logger or get_logger("apiscan.stub")
+
+    async def generate(
+        self,
+        category: str,
+        context: str,
+        seed_payloads: List[str],
+        n: Optional[int] = None,
+    ) -> List[str]:
+        """Return seed payloads unchanged."""
+        return list(seed_payloads)
 
 
 def _dedupe(items: List[str]) -> List[str]:
